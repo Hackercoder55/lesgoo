@@ -1,0 +1,40 @@
+# secrets
+.env
+.env.*
+
+# media and renders - gigabytes, and the masters are client footage
+*.mp4
+*.mov
+*.wav
+*.webp
+*.npz
+source/
+final/
+review/
+
+# per-video working data and generated segments
+segments/
+segments2/
+segments3/
+segments_*/
+work*/
+cache/
+logs/
+
+# job records hold sync.so asset URLs and generation ids
+metadata/
+
+# downloaded models - fetched by the README steps
+models/*.onnx
+
+# python
+__pycache__/
+*.pyc
+
+# client material - story dialogue and character names, and the internal design doc
+blender_lipsync_automation.md
+plan2.py
+plan3.py
+plan3b.py
+talking3.py
+speakers.py
