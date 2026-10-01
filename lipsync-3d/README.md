@@ -31,7 +31,16 @@ Cached analysis is keyed by its settings (`words_<model>_<lang>.json`,
 `scan_<size>_<score>.npz`), so changing a flag re-runs that stage.
 
 It never retries a failed segment by itself. A segment that fails is
-reported and the original is left in place.
+reported and the original is left in place. To resubmit only the failed
+ones:
+
+```
+python run.py source/video4.mp4 --go --retry
+```
+
+Segments that already synced and still match the plan are reused, not
+paid for again. Without `--retry` a failed segment goes back under the
+same idempotency key, and sync.so returns the same failed generation.
 
 ## Setup
 

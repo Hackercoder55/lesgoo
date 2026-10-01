@@ -386,10 +386,34 @@ def face_image(cfg, seg, frame_number, box):
     return "data:image/webp;base64," + base64.b64encode(out).decode() if out else None
 
 
-def generate(cfg, plan):
+def generate(cfg, plan, retry=False):
+    """A segment whose synced clip from an earlier run still matches its
+    frame range and passes validation is reused, not paid for again.
+
+    Without --retry a failed segment is resubmitted under the same
+    idempotency key, so sync.so hands back the same failed generation.
+    --retry gives it a new attempt number and with it a new key."""
     def one(p):
         sid = f"s{p['n']:02d}"
         d = cfg["segin"] / sid
+        out = cfg["segout"] / sid
+        meta = out / "result.json"
+        prev = json.loads(meta.read_text()) if meta.exists() else {}
+        same = prev.get("final") == p["final"]
+        if same and prev.get("ok") and (out / "synced.mp4").exists():
+            checks, _, _ = L.validate(d / "seg.mp4", out / "synced.mp4")
+            if all(c[2] for c in checks.values()):
+                print(f"  {sid} reusing earlier result", flush=True)
+                return sid, True
+        attempt = prev.get("attempt", 0) if same else 0
+        if retry and same and not prev.get("ok"):
+            attempt += 1
+
+        def record(ok, status):
+            out.mkdir(parents=True, exist_ok=True)
+            meta.write_text(json.dumps({"final": p["final"], "ok": ok,
+                                        "status": status, "attempt": attempt}))
+
         try:
             v, a = L.upload(d / "seg.mp4"), L.upload(d / "seg.wav")
             asd = None
@@ -402,12 +426,14 @@ def generate(cfg, plan):
                     asd["face_image"] = fi
             idem = str(uuid.uuid5(uuid.NAMESPACE_URL,
                                   f"{cfg['src'].stem}:{sid}:{p['final'][0]}:"
-                                  f"{p.get('coords')}"))
+                                  f"{p.get('coords')}"
+                                  + (f":retry{attempt}" if attempt else "")))
             g = L.poll(L.submit(v, a, idem, asd)["id"])
             if g["status"] != "COMPLETED":
-                print(f"  {sid} {g['status']} -> keeping original", flush=True)
+                print(f"  {sid} {g['status']} {g.get('error') or ''} -> keeping original",
+                      flush=True)
+                record(False, g["status"])
                 return sid, False
-            out = cfg["segout"] / sid
             out.mkdir(parents=True, exist_ok=True)
             subprocess.run(["curl", "-sfL", "-o", str(out / "synced.mp4"),
                             g["outputMediaUrl"]], check=True)
@@ -415,9 +441,11 @@ def generate(cfg, plan):
             ok = all(c[2] for c in checks.values())
             print(f"  {sid} {'OK' if ok else 'FAILED ' + str([k for k, c in checks.items() if not c[2]])}",
                   flush=True)
+            record(ok, "COMPLETED" if ok else "VALIDATION_FAILED")
             return sid, ok
         except Exception as e:
             print(f"  {sid} ERROR {e} -> keeping original", flush=True)
+            record(False, f"ERROR {e}")
             return sid, False
 
     with ThreadPoolExecutor(max_workers=7) as ex:
@@ -656,6 +684,8 @@ def main():
                     help="speech language for whisper, e.g. en, hi; 'auto' detects")
     ap.add_argument("--whisper-model", default="small",
                     help="small, medium, large-v3 - bigger misses fewer words")
+    ap.add_argument("--retry", action="store_true",
+                    help="resubmit segments that failed on an earlier --go")
     a = ap.parse_args()
 
     global FACE_SCORE
@@ -705,8 +735,12 @@ def main():
 
     print("\n[5/7] extracting and generating")
     extract_all(cfg, plan)
-    usable = set(generate(cfg, plan))
+    usable = set(generate(cfg, plan, a.retry))
     (cfg["work"] / "usable.json").write_text(json.dumps(sorted(usable)))
+    failed = [f"s{p['n']:02d}" for p in plan if f"s{p['n']:02d}" not in usable]
+    if failed:
+        print(f"\n  not synced, original kept: {', '.join(failed)}"
+              f"\n  run again with --go --retry to resubmit only these")
     if not usable:
         sys.exit("nothing usable - original left untouched")
 
