@@ -31,7 +31,8 @@ import lipsync as L
 
 ROOT = Path(__file__).parent
 RATE = 0.5333                     # credits per frame, sync-3, measured
-DW, DH = 540, 960                 # face-detection scale
+DW, DH = 540, 960                 # face-detection scale, reset per video
+FACE_SCORE = 0.6                  # YuNet confidence, --face-score
 YUNET = ROOT / "models" / "yunet.onnx"
 
 
@@ -52,13 +53,26 @@ def probe(src):
     csp = s.get("color_space") or "bt709"
     rng = s.get("color_range") or "tv"
     h264_trc = {"bt709": 1, "iec61966-2-1": 13, "smpte170m": 6}.get(trc, 1)
+    w, h = int(s["width"]), int(s["height"])
     return {
-        "src": Path(src), "w": int(s["width"]), "h": int(s["height"]),
-        "fps": round(int(num) / int(den)), "total": int(s["nb_read_frames"]),
+        "src": Path(src), "w": w, "h": h,
+        # exact rate, not rounded: 29.97 treated as 30 drifts the spliced
+        # picture against the master audio by a frame every ~33 s
+        "fps": int(num) / int(den), "rate": f"{num}/{den}",
+        "total": int(s["nb_read_frames"]),
         "trc": trc, "prim": prim, "csp": csp, "range": rng, "h264_trc": h264_trc,
         "setparams": (f"setparams=color_primaries={prim}:color_trc={trc}"
                       f":colorspace={csp}:range={rng},"),
     }
+
+
+def set_det_size(w, h, long_side=960):
+    """Detect on the master's own aspect ratio. A fixed 540x960 is right for
+    9:16 shorts but squashes a 16:9 frame to a third of its width, and the
+    detector then misses most faces."""
+    global DW, DH
+    k = long_side / max(w, h)
+    DW, DH = int(round(w * k / 2)) * 2, int(round(h * k / 2)) * 2
 
 
 def work_dirs(cfg):
@@ -76,18 +90,20 @@ def work_dirs(cfg):
 
 # ------------------------------------------------------------- analysis
 
-def transcribe(cfg):
+def transcribe(cfg, model="small", language="en"):
     wav = cfg["work"] / "audio16k.wav"
-    words = cfg["work"] / "words.json"
+    # keyed by model and language so changing either re-transcribes instead
+    # of silently reusing the old words
+    words = cfg["work"] / f"words_{model}_{language or 'auto'}.json"
     if words.exists():
         return json.loads(words.read_text())
     subprocess.run(["ffmpeg", "-v", "error", "-i", str(cfg["src"]), "-map", "0:a:0",
                     "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
                     "-y", str(wav)], check=True)
     from faster_whisper import WhisperModel
-    m = WhisperModel("small", device="cpu", compute_type="int8")
+    m = WhisperModel(model, device="cpu", compute_type="int8")
     segs, _ = m.transcribe(str(wav), word_timestamps=True, vad_filter=False,
-                           language="en")
+                           language=language)
     out = [{"start": round(s.start, 2), "end": round(s.end, 2),
             "text": s.text.strip(),
             "words": [{"w": w.word.strip(), "s": round(w.start, 2),
@@ -120,10 +136,10 @@ def scan(cfg):
     Mouth movement is scored against whole-frame movement. Raw mouth
     difference just measures cuts and camera moves - a shot change scores
     higher than a spoken sentence."""
-    npz = cfg["work"] / "scan.npz"
+    npz = cfg["work"] / f"scan_{DW}x{DH}_{FACE_SCORE}.npz"
     if npz.exists():
         return dict(np.load(npz))
-    det = cv2.FaceDetectorYN.create(str(YUNET), "", (DW, DH), 0.6, 0.3, 5000)
+    det = cv2.FaceDetectorYN.create(str(YUNET), "", (DW, DH), FACE_SCORE, 0.3, 5000)
     p = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-i", str(cfg["src"]), "-map", "0:v:0",
          "-fps_mode", "passthrough", "-vf", f"scale={DW}:{DH}",
@@ -173,12 +189,30 @@ def scan(cfg):
 
 # ----------------------------------------------------------------- plan
 
+def runs_of(mask):
+    """[first, last] inclusive for every run of True frames."""
+    out, i, n = [], 0, len(mask)
+    while i < n:
+        if mask[i]:
+            j = i
+            while j + 1 < n and mask[j + 1]:
+                j += 1
+            out.append([i, j])
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
 def build_plan(cfg, words, cuts, sc, min_face_pct, min_run, merge_gap):
     """Segments come from the footage, not from the transcript's grammar.
 
     Reading narration as voice-over and skipping it was right on two videos
     and wrong on the third, where the characters mouth the narration too -
-    that mistake left most of the video unsynced."""
+    that mistake left most of the video unsynced.
+
+    Returns the plan and the spoken stretches it leaves out, with the reason
+    for each, so a skipped line is reported instead of silently missing."""
     n = cfg["total"]
     fps = cfg["fps"]
     speech = np.zeros(n, bool)
@@ -188,38 +222,42 @@ def build_plan(cfg, words, cuts, sc, min_face_pct, min_run, merge_gap):
     big = sc["area"] > DW * DH * (min_face_pct / 100.0)
     cand = sc["face"] & big & speech
 
-    runs, i = [], 0
-    while i < n:
-        if cand[i]:
-            j = i
-            while j + 1 < n and cand[j + 1]:
-                j += 1
-            if j - i + 1 >= min_run:
-                runs.append([i, j])
-            i = j + 1
-        else:
-            i += 1
-
     def shot(f):
         t = f / fps
         return (max([c for c in cuts if c <= t], default=0.0),
                 min([c for c in cuts if c > t], default=n / fps))
 
+    # Join first, then drop what is still too short. Dropping first lost
+    # most of the dialogue: whisper leaves gaps between words and the face
+    # detector misses odd frames, so a normal sentence arrives as 5-10 frame
+    # pieces, and each piece fell under min_run before it could be joined.
     merged = []
-    for r in runs:
+    for r in runs_of(cand):
         if merged and r[0] - merged[-1][1] <= merge_gap \
                 and shot(merged[-1][1]) == shot(r[0]):
             merged[-1][1] = r[1]
         else:
             merged.append(r)
+    kept = [r for r in merged if r[1] - r[0] + 1 >= min_run]
 
-    plan = []
-    for k, (a, b) in enumerate(merged, 1):
-        said = " ".join(w["w"] for s in words for w in s["words"]
+    def said(a, b):
+        return " ".join(w["w"] for s in words for w in s["words"]
                         if w["e"] > a / fps and w["s"] < (b + 1) / fps)
-        plan.append({"n": k, "final": [a, b], "frames": b - a + 1,
-                     "text": said[:60]})
-    return plan
+
+    plan = [{"n": k, "final": [a, b], "frames": b - a + 1, "text": said(a, b)[:60]}
+            for k, (a, b) in enumerate(kept, 1)]
+
+    covered = np.zeros(n, bool)
+    for a, b in kept:
+        covered[a:b + 1] = True
+    why = np.where(~sc["face"], 0, np.where(~big, 1, 2))
+    reasons = ("no face detected", f"face under --min-face {min_face_pct}%",
+               f"shorter than --min-run {min_run}")
+    missed = [{"frames": [a, b],
+               "why": reasons[int(np.bincount(why[a:b + 1], minlength=3).argmax())],
+               "text": said(a, b)[:60]}
+              for a, b in runs_of(speech & ~covered)]
+    return plan, missed
 
 
 def speakers(cfg, plan):
@@ -228,7 +266,7 @@ def speakers(cfg, plan):
     Left alone sync.so takes the most prominent face, and the compositor
     used to mask the biggest one - between them they twice synced a
     bystander and then threw the correct result away."""
-    det = cv2.FaceDetectorYN.create(str(YUNET), "", (DW, DH), 0.6, 0.3, 5000)
+    det = cv2.FaceDetectorYN.create(str(YUNET), "", (DW, DH), FACE_SCORE, 0.3, 5000)
     sx, sy = cfg["w"] / DW, cfg["h"] / DH
     out = []
     for p in plan:
@@ -321,7 +359,7 @@ def extract_all(cfg, plan):
                   f"asplit=2[a{i}][w{i}]")
         maps += ["-map", f"[v{i}]", "-map", f"[a{i}]",
                  "-c:v", "libx264", "-crf", "12", "-preset", "medium",
-                 "-pix_fmt", "yuv420p", "-r", str(cfg["fps"]),
+                 "-pix_fmt", "yuv420p", "-r", cfg["rate"],
                  "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
                  "-movflags", "+faststart", str(d / "seg.mp4")]
         maps += ["-map", f"[w{i}]", "-vn", "-c:a", "pcm_s16le", "-ar", "48000",
@@ -396,7 +434,7 @@ def composite(cfg, plan, usable):
     flicker. All of this stays in yuv444p and writes no colour tags - a
     bgr24 roundtrip moved the picture +2.3 Y and tagging the encoder
     another -4.5 Y."""
-    det = cv2.FaceDetectorYN.create(str(YUNET), "", (DW, DH), 0.6, 0.3, 5000)
+    det = cv2.FaceDetectorYN.create(str(YUNET), "", (DW, DH), FACE_SCORE, 0.3, 5000)
     W, H = cfg["w"], cfg["h"]
     scx, scy = W / DW, H / DH
     plane, frame = W * H, W * H * 3
@@ -413,7 +451,7 @@ def composite(cfg, plan, usable):
         A, B = rd(src), rd(syn)
         out = subprocess.Popen(
             ["ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv444p",
-             "-s", f"{W}x{H}", "-r", str(cfg["fps"]), "-i", "-", "-i", str(src),
+             "-s", f"{W}x{H}", "-r", cfg["rate"], "-i", "-", "-i", str(src),
              "-map", "0:v", "-map", "1:a?", "-c:v", "libx264", "-crf", "12",
              "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac",
              "-b:a", "192k", "-fps_mode", "passthrough", "-y", str(dst)],
@@ -475,18 +513,20 @@ def splice(cfg, plan, usable):
         c = cfg["segout"] / sid / "composited.mp4"
         inputs += ["-i", str(c if c.exists() else cfg["segout"] / sid / "synced.mp4")]
     sp = cfg["setparams"]
+    num, den = cfg["rate"].split("/")
+    pts = f"setpts=N*{den}/{num}/TB"
     fc, labels, cursor = [], [], 0
     for idx, (a, b, _) in enumerate(segs, start=1):
         if a > cursor:
             fc.append(f"[0:v:0]trim=start_frame={cursor}:end_frame={a},"
-                      f"{sp}setpts=N/{cfg['fps']}/TB[o{idx}]")
+                      f"{sp}{pts}[o{idx}]")
             labels.append(f"o{idx}")
-        fc.append(f"[{idx}:v]{sp}setpts=N/{cfg['fps']}/TB[s{idx}]")
+        fc.append(f"[{idx}:v]{sp}{pts}[s{idx}]")
         labels.append(f"s{idx}")
         cursor = b + 1
     if cursor < cfg["total"]:
         fc.append(f"[0:v:0]trim=start_frame={cursor}:end_frame={cfg['total']},"
-                  f"{sp}setpts=N/{cfg['fps']}/TB[oz]")
+                  f"{sp}{pts}[oz]")
         labels.append("oz")
     fc.append("".join(f"[{l}]" for l in labels) + f"concat=n={len(labels)}:v=1:a=0[out]")
     cfg["out"].parent.mkdir(exist_ok=True)
@@ -610,23 +650,35 @@ def main():
                     help="smallest face to sync, %% of frame area")
     ap.add_argument("--min-run", type=int, default=12)
     ap.add_argument("--merge-gap", type=int, default=10)
+    ap.add_argument("--face-score", type=float, default=0.6,
+                    help="face detector confidence; lower it for stylised faces")
+    ap.add_argument("--language", default="en",
+                    help="speech language for whisper, e.g. en, hi; 'auto' detects")
+    ap.add_argument("--whisper-model", default="small",
+                    help="small, medium, large-v3 - bigger misses fewer words")
     a = ap.parse_args()
 
+    global FACE_SCORE
+    FACE_SCORE = a.face_score
     cfg = work_dirs(probe(a.video))
-    print(f"{cfg['src'].name}: {cfg['w']}x{cfg['h']} {cfg['fps']}fps "
+    set_det_size(cfg["w"], cfg["h"])
+    print(f"{cfg['src'].name}: {cfg['w']}x{cfg['h']} {cfg['fps']:.3f}fps "
           f"{cfg['total']} frames, transfer={cfg['trc']}")
 
     print("\n[1/7] transcribing")
-    words = transcribe(cfg)
+    words = transcribe(cfg, a.whisper_model,
+                       None if a.language == "auto" else a.language)
     print("[2/7] scene cuts")
     cuts = cuts_of(cfg)
     print(f"      {len(cuts)} cuts")
     print("[3/7] scanning faces and mouths")
     sc = scan(cfg)
     print("[4/7] planning from the footage")
-    plan = build_plan(cfg, words, cuts, sc, a.min_face, a.min_run, a.merge_gap)
+    plan, missed = build_plan(cfg, words, cuts, sc, a.min_face, a.min_run,
+                              a.merge_gap)
     plan = speakers(cfg, plan)
     (cfg["work"] / "plan.json").write_text(json.dumps(plan, indent=1))
+    (cfg["work"] / "missed.json").write_text(json.dumps(missed, indent=1))
 
     total = sum(p["frames"] for p in plan)
     print(f"\n{'seg':6}{'time':>16}{'sec':>6}{'cr':>6}  words")
@@ -638,6 +690,14 @@ def main():
           f"= {total*RATE:.0f} credits (${total*RATE/100:.2f})")
     print(f"whole video would be {cfg['total']*RATE:.0f} credits "
           f"- saving {(1-total/cfg['total'])*100:.0f}%")
+
+    long_missed = [m for m in missed if m["frames"][1] - m["frames"][0] + 1 >= 3]
+    if long_missed:
+        print(f"\nspeech NOT synced ({len(long_missed)} stretches) - check these:")
+        for m in long_missed:
+            x, b = m["frames"]
+            print(f"  {x/cfg['fps']:7.2f}-{(b+1)/cfg['fps']:<8.2f}{m['why']:28}"
+                  f"{m['text'][:40]}")
 
     if not a.go:
         print("\nplan only. re-run with --go to spend credits.")

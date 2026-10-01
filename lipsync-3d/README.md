@@ -17,7 +17,18 @@ python run.py source/video4.mp4 --go     # generate, composite, splice, verify
 ```
 
 Tuning: `--min-face` (smallest face to sync, % of frame area, default 2),
-`--min-run`, `--merge-gap`.
+`--min-run`, `--merge-gap`, `--face-score` (detector confidence, default
+0.6; lower it for stylised faces), `--language` (`en` by default, `hi`,
+or `auto`), `--whisper-model` (`small` by default; `medium` or `large-v3`
+miss fewer words).
+
+The plan output ends with **speech NOT synced**: every spoken stretch the
+plan leaves out, with the reason (no face detected, face too small, too
+short). It is also written to `work_<video>/missed.json`. Read it before
+`--go`; the reason says which flag to change.
+
+Cached analysis is keyed by its settings (`words_<model>_<lang>.json`,
+`scan_<size>_<score>.npz`), so changing a flag re-runs that stage.
 
 It never retries a failed segment by itself. A segment that fails is
 reported and the original is left in place.
@@ -45,6 +56,20 @@ reported and the original is left in place.
   first and read the verify output.
 - Lip quality is sync.so's, not this code's. What this code guarantees is
   that it checks its own output and does not silently damage the original.
+
+## Why it skipped dialogue (fixed)
+
+- The planner dropped runs shorter than `--min-run` **before** joining
+  them. Whisper leaves small gaps between words and the face detector
+  misses odd frames, so a normal sentence arrived as 5-10 frame pieces and
+  most of it was thrown away. It now joins first and drops only what is
+  still short. On a synthetic 4 s sentence: before 14 frames synced, after 94.
+- Faces were detected on a fixed 540x960 frame. That is right for 9:16
+  shorts but squashes a 16:9 frame, and the detector then misses faces.
+  The detection size now follows the video's aspect ratio.
+- The frame rate was rounded (29.97 -> 30), which drifts the spliced
+  picture against the audio by about a frame every 33 s. The exact rate
+  is now used.
 
 ## Files
 
