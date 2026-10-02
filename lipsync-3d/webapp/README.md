@@ -20,7 +20,18 @@ What it does:
 - **Accounts**: users and admins, plus API keys for scripts and tools.
 - **REST API**: works like sync.so's. Interactive docs are at `/v1/docs`.
 
-## Option 1: on an animator's own PC (Windows)
+## Easiest: Windows, two double-clicks
+
+1. `SETUP.bat` (repository root), once. It installs ffmpeg, Python, the
+   model's packages (plus the C++ build tools if needed) and the weights,
+   all into this folder. Takes 20-40 min the first time. Safe to run again.
+2. `START.bat`, every time. The browser opens on the site. Close the
+   black window to stop it.
+
+On a GPU under 10 GB the site starts with low-VRAM settings (guidance
+1.0, 512 px crop).
+
+## Option 1: on an animator's own PC (Windows), by hand
 
 Do the one-time setup from `lipsync-3d/README.md` first: the Python env,
 `requirements.txt`, the checkpoints and `yunet.onnx`. Then:

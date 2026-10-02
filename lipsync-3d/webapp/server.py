@@ -246,7 +246,9 @@ def model_problems():
                    "'pip install -r requirements.txt' in the repository folder, then restart")
     else:
         import torch
-        if not torch.cuda.is_available():
+        if torch.cuda.is_available():
+            CFG["vram_gb"] = round(torch.cuda.get_device_properties(0).total_memory / 2**30, 1)
+        else:
             out.append("torch is installed without CUDA, or no NVIDIA GPU is visible - "
                        "install the CUDA build: pip install torch==2.5.1 torchvision==0.20.1 "
                        "--index-url https://download.pytorch.org/whl/cu121")
@@ -350,7 +352,8 @@ def create_app():
     def me(u=Depends(user_of)):
         return {"name": u["name"], "admin": bool(u["admin"]), "local": CFG["local"],
                 "engine": CFG["engine"], "gpu_busy": WORKER.current is not None,
-                "missing": core.missing() + MODEL_PROBLEMS}
+                "missing": core.missing() + MODEL_PROBLEMS,
+                "vram_gb": CFG.get("vram_gb")}
 
     class PwChange(BaseModel):
         old: str

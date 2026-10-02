@@ -32,6 +32,17 @@ async function loadMe() {
   $('#allWrap').hidden = !me.admin || me.local;
   $('#warn').innerHTML = (me.missing || []).map((m) =>
     `<div class="warnbox">Setup needed: ${esc(m)}</div>`).join('');
+  if (me.vram_gb && !state.vramSet) {
+    state.vramSet = true;
+    $('#gpu').title = `${me.vram_gb} GB GPU`;
+    if (me.vram_gb < 10) {
+      // small GPU: no classifier-free guidance halves the model's memory,
+      // and a smaller crop keeps the frames small
+      $('#guidance').value = '1.0';
+      $('#cropMax').value = '512';
+      $('#engine').textContent += ` · low-VRAM settings (${me.vram_gb} GB GPU)`;
+    }
+  }
 }
 $('#btnOut').onclick = async () => { await post('/auth/logout'); location.href = '/login'; };
 
