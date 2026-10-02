@@ -7,6 +7,7 @@ every frame outside the synced stretches is copied from the original.
 """
 
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -67,10 +68,12 @@ def speech_segments(video, opts, log):
             out.append((s, s + opts["max_segment"]))
             s += opts["max_segment"]
         out.append((s, e))
-    # padding can make neighbours overlap; join them
+    # padding can make neighbours overlap; join them. Strictly overlapping
+    # only: the max_segment pieces above touch end to start, and joining
+    # those undid the split (a 92 s monologue went to the model in one go)
     final = []
     for s, e in out:
-        if final and s <= final[-1][1]:
+        if final and s < final[-1][1]:
             final[-1] = (final[-1][0], max(e, final[-1][1]))
         else:
             final.append((s, e))
@@ -112,6 +115,8 @@ def run(video, workdir, settings, ls, log, cancelled=lambda: False):
         if b - a >= 3:
             plan.append((a, b))                      # [a, b) in frames
     report, done = [], []
+    todo = sum(b - a for a, b in plan) / fr
+    spent = synced = 0.0
     for k, (a, b) in enumerate(plan, 1):
         if cancelled():
             raise RuntimeError("cancelled")
@@ -119,7 +124,12 @@ def run(video, workdir, settings, ls, log, cancelled=lambda: False):
         d = work / sid
         d.mkdir(parents=True, exist_ok=True)
         seg = d / "source.mp4"
-        log(f"[{k}/{len(plan)}] {a/fr:.2f}-{b/fr:.2f}s")
+        eta = ""
+        if synced:
+            left = (todo - synced) * spent / synced
+            eta = f" - about {left/60:.0f} min left" if left >= 60 else f" - about {left:.0f}s left"
+        log(f"[{k}/{len(plan)}] {a/fr:.2f}-{b/fr:.2f}s{eta}")
+        t0 = time.time()
         core.sh(["ffmpeg", "-v", "error", "-i", str(video), "-filter_complex",
                  f"[0:v:0]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS[v];"
                  f"[0:a:0]atrim={a/fr:.6f}:{b/fr:.6f},asetpts=PTS-STARTPTS[a]",
@@ -143,10 +153,13 @@ def run(video, workdir, settings, ls, log, cancelled=lambda: False):
             if abs(n - (b - a)) > 2:      # splice() evens out a frame or two
                 raise RuntimeError(f"synced segment has {n} frames, expected {b - a}")
             done.append((a, b, out))
-            report.append({**rec, "status": "synced"})
+            report.append({**rec, "status": "synced",
+                           "seconds": round(time.time() - t0, 1)})
         except Exception as e:
             log(f"    FAILED: {e} - left as the original")
             report.append({**rec, "status": "failed", "why": str(e)})
+        spent += time.time() - t0
+        synced += (b - a) / fr
     dst = work / "lipsynced.mp4"
     splice(video, m, total, done, dst)
     log(f"spliced {len(done)} synced segment(s) into the full video")
