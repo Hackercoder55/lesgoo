@@ -354,7 +354,8 @@ def create_app():
         return {"name": u["name"], "admin": bool(u["admin"]), "local": CFG["local"],
                 "engine": CFG["engine"], "gpu_busy": WORKER.current is not None,
                 "missing": core.missing() + MODEL_PROBLEMS,
-                "vram_gb": CFG.get("vram_gb")}
+                "vram_gb": CFG.get("vram_gb"),
+                "model": "512px" if "512" in CFG["ls"]["config"] else "256px"}
 
     class PwChange(BaseModel):
         old: str

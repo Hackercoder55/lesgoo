@@ -23,7 +23,7 @@ const post = (p, b) => api(p, {method: 'POST', headers: {'content-type': 'applic
 async function loadMe() {
   const me = state.me = await api('/v1/me');
   $('#engine').textContent = me.engine === 'preview' ? 'engine: preview (no model)'
-                                                     : 'engine: LatentSync';
+                                                     : `engine: LatentSync ${me.model || ''}`;
   $('#gpu').textContent = me.gpu_busy ? 'GPU busy' : 'GPU idle';
   $('#gpu').className = 'badge ' + (me.gpu_busy ? 'busy' : 'live');
   $('#who').textContent = me.local ? 'local mode' : me.name;
