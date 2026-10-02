@@ -1,0 +1,7 @@
+checkpoints/
+**/site_data/
+**/studio_runs/
+**/work_*/
+**/segments_*/
+.git/
+temp/

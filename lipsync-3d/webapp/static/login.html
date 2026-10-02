@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Lip-Sync Studio</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<form class="panel login" id="f">
+  <h1>Lip-Sync <span>Studio</span></h1>
+  <p>Sign in to your team workspace.</p>
+  <label>Name</label>
+  <input name="name" autocomplete="username" required autofocus>
+  <label>Password</label>
+  <input name="password" type="password" autocomplete="current-password" required>
+  <button class="primary submit" type="submit">Sign in</button>
+  <div class="err" id="err"></div>
+</form>
+<script>
+document.getElementById('f').onsubmit = async (e) => {
+  e.preventDefault();
+  const d = Object.fromEntries(new FormData(e.target));
+  const r = await fetch('/auth/login', {method: 'POST',
+    headers: {'content-type': 'application/json'}, body: JSON.stringify(d)});
+  if (r.ok) location.href = '/';
+  else document.getElementById('err').textContent =
+    (await r.json().catch(() => ({}))).detail || 'Sign in failed';
+};
+</script>
+</body>
+</html>

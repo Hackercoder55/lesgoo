@@ -154,7 +154,9 @@ def prepare(video, audio, mode, dst):
     if not am["audio"]:
         raise RuntimeError("no audio: upload an audio file or a video that has sound")
     vd, ad = vm["duration"], am["duration"]
-    dur = min(vd, ad) if mode == "cut" else ad
+    # re-syncing a clip to its own sound keeps every frame: the audio track
+    # often ends a frame early, and cutting to it would drop the last one
+    dur = vd if not audio else min(vd, ad) if mode == "cut" else ad
     vin = ["-i", str(video)]
     if mode == "bounce" and ad > vd:
         pp = dst.with_name("pingpong.mp4")
@@ -166,6 +168,7 @@ def prepare(video, audio, mode, dst):
     elif mode in ("loop", "bounce") and ad > vd:
         vin = ["-stream_loop", "-1", "-i", str(video)]
     sh(["ffmpeg", "-v", "error", *vin, "-i", str(src_a), "-map", "0:v:0", "-map", "1:a:0",
+        *(["-af", "apad"] if not audio else []),
         "-t", f"{dur:.3f}", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
         "-pix_fmt", "yuv420p", "-r", vm["rate"], "-c:a", "pcm_s16le", "-ar", "48000",
         "-y", str(dst)])
@@ -300,9 +303,10 @@ def blend(clip, m, crop_out, box, tr, dst):
 
 
 def lipsync(video, audio, pick, mode, engine, steps, guidance, seed, crop_max,
-            score, ls, log=print):
-    """pick: {"t": seconds, "box": (cx, cy, w, h)} - the face to sync."""
-    run = RUNS / time.strftime("%Y%m%d_%H%M%S")
+            score, ls, log=print, run=None):
+    """pick: {"t": seconds, "box": (cx, cy, w, h)} - the face to sync.
+    run: folder for this job's files (default: a new one in studio_runs)."""
+    run = Path(run) if run else RUNS / time.strftime("%Y%m%d_%H%M%S")
     run.mkdir(parents=True, exist_ok=True)
     log(f"run folder: {run}")
     clip = run / "input.mp4"
