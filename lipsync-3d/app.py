@@ -251,9 +251,24 @@ def run_model(engine, crop_in, wav, crop_out, steps, guidance, seed, ls, log):
                 "size' so the face is bigger in the crop.")
         raise
     log(f"LatentSync: {time.time()-t:.0f}s, peak VRAM {vram:.2f} GB")
+    missed = list(getattr(pipe, "missed_frames", []) or [])
+    Path(str(crop_out) + ".missed.json").write_text(json.dumps(missed))
+    if missed:
+        log(f"LatentSync's face finder missed the face on {len(missed)} frame(s); "
+            f"those keep the original mouth instead of a warped one")
 
 
-def blend(clip, m, crop_out, box, tr, dst):
+def smooth_track(tr, k=5):
+    """Moving average over k frames: the detector's box jitters by a few
+    pixels, and a mask that jitters makes the mouth edge shimmer."""
+    a = np.asarray(tr, float)
+    if len(a) < k:
+        return a
+    pad = np.pad(a, ((k // 2, k // 2), (0, 0)), mode="edge")
+    return np.stack([pad[i:i + len(a)] for i in range(k)]).mean(0)
+
+
+def blend(clip, m, crop_out, box, tr, dst, mask_scale=1.0):
     """Paste only the mouth back. The model's output is level-matched to the
     original over the rest of the crop, so no seam flickers, and every pixel
     outside the mouth ellipse stays the original's. Works in yuv444p: an
@@ -272,15 +287,20 @@ def blend(clip, m, crop_out, box, tr, dst):
          "-bsf:v", f"h264_metadata=colour_primaries=1:transfer_characteristics={trc}:"
                    f"matrix_coefficients=1:video_full_range_flag=0",
          "-shortest", "-movflags", "+faststart", "-y", str(dst)], stdin=subprocess.PIPE)
+    mf = Path(str(crop_out) + ".missed.json")
+    missed = set(json.loads(mf.read_text())) if mf.exists() else set()
+    tr = smooth_track(tr)
     n = 0
     for i, o in enumerate(frames(clip, W, H, "yuv444p")):
         g = next(syn, None)
         out = o.copy()
-        if g is not None and i < len(tr):
+        ci = int(i / m["fps"] * LS_FPS + 1e-6)       # this frame in the model's 25 fps clip
+        if g is not None and i < len(tr) and ci not in missed:
             cx, cy, fw, fh = tr[i]
             mask = np.zeros((s, s), np.uint8)
             cv2.ellipse(mask, (int(cx - x0), int(cy - y0 + fh * .22)),
-                        (int(fw * .42), int(fh * .30)), 0, 0, 360, 255, -1)
+                        (max(1, int(fw * .42 * mask_scale)), max(1, int(fh * .30 * mask_scale))),
+                        0, 0, 360, 255, -1)
             k = int(max(fw, fh) * .12) | 1
             a = cv2.GaussianBlur(mask, (k, k), 0).astype(np.float32) / 255
             rest = a < .02
@@ -303,7 +323,7 @@ def blend(clip, m, crop_out, box, tr, dst):
 
 
 def lipsync(video, audio, pick, mode, engine, steps, guidance, seed, crop_max,
-            score, ls, log=print, run=None, track_=None):
+            score, ls, log=print, run=None, track_=None, mask_scale=1.0):
     """pick: {"t": seconds, "box": (cx, cy, w, h)} - the face to sync.
     run: folder for this job's files (default: a new one in studio_runs).
     track_: the face's (cx, cy, w, h) on every frame, when the caller has
@@ -329,7 +349,7 @@ def lipsync(video, audio, pick, mode, engine, steps, guidance, seed, crop_max,
     run_model(engine, crop_in, clip.with_suffix(".wav"), crop_out,
               steps, guidance, seed, ls, log)
     dst = run / "lipsynced.mp4"
-    n = blend(clip, m, crop_out, box, tr, dst)
+    n = blend(clip, m, crop_out, box, tr, dst, mask_scale)
     got = probe(dst)
     log(f"done: {n} frames, {got['duration']:.2f}s -> {dst}")
     (run / "run.json").write_text(json.dumps(

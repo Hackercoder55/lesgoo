@@ -262,6 +262,9 @@ class LipsyncPipeline(DiffusionPipeline):
         if not found:
             raise RuntimeError("Face not detected")
         missed = len(lmks) - len(found)
+        # callers can keep the original picture on these frames: a borrowed
+        # landmark set warps a moving face out of shape
+        self.missed_frames = [i for i, l in enumerate(lmks) if l is None]
         if missed:
             print(f"Face missed on {missed}/{len(lmks)} frames; using the nearest detected frame's landmarks")
         for i, frame in enumerate(video_frames):

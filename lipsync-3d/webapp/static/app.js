@@ -200,7 +200,7 @@ $('#btnGo').onclick = async () => {
   const num = (id) => parseFloat($(id).value);
   const b = {kind: state.kind, video: state.video.id, steps: num('#steps'),
              guidance: num('#guidance'), seed: num('#seed'), crop_max: num('#cropMax'),
-             score: num('#score')};
+             score: num('#score'), mask_scale: num('#maskScale')};
   if (state.kind === 'clip') {
     b.mode = $('#mode').value;
     if (state.audio) b.audio = state.audio.id;

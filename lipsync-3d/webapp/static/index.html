@@ -91,6 +91,9 @@
         <div><label>Lip strength (guidance)</label><input id="guidance" type="number" value="1.5" step="0.1" min="1" max="3.5"></div>
         <div><label>Seed</label><input id="seed" type="number" value="1247"></div>
         <div><label>Max crop px (lower = less VRAM)</label><input id="cropMax" type="number" value="768" step="64" min="256" max="2048"></div>
+        <div><label>Mouth area replaced (smaller = less face change)</label>
+          <select id="maskScale"><option value="0.75">Small - lips only</option>
+            <option value="1.0" selected>Normal</option><option value="1.25">Large - lips and jaw</option></select></div>
         <div><label>Detector confidence (lower for 3D/cartoon)</label><input id="score" type="number" value="0.5" step="0.05" min="0.1" max="0.95"></div>
       </div>
       <div id="autoOnly" hidden>

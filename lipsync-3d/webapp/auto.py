@@ -553,7 +553,8 @@ def run(video, workdir, settings, ls, log, cancelled=lambda: False,
                                      settings["seed"], settings["crop_max"],
                                      settings["score"], ls,
                                      log=lambda s: log("    " + s),
-                                     run=d / f"{fid}_run{j}", track_=boxes)
+                                     run=d / f"{fid}_run{j}", track_=boxes,
+                                     mask_scale=settings.get("mask_scale", 1.0))
                     c = count_frames(o)
                     if abs(c - (rb - ra)) > 2:
                         raise RuntimeError(f"got {c} frames, expected {rb - ra}")
