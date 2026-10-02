@@ -164,7 +164,8 @@ class Worker(threading.Thread):
         settings = {"engine": CFG["engine"], "steps": p["steps"],
                     "guidance": p["guidance"], "seed": p["seed"],
                     "crop_max": p["crop_max"], "score": p["score"],
-                    "auto": p.get("auto"), "mask_scale": p.get("mask_scale", 1.0)}
+                    "auto": {**(p.get("auto") or {}), "max_turn": p.get("max_turn", 0.75)},
+                    "mask_scale": p.get("mask_scale", 1.0)}
         try:
             video = asset_path(p["video"])
             if job["kind"] == "auto":
@@ -185,7 +186,8 @@ class Worker(threading.Thread):
                 out = core.lipsync(video, audio, face, p["mode"], CFG["engine"],
                                    p["steps"], p["guidance"], p["seed"], p["crop_max"],
                                    p["score"], CFG["ls"], log, run=work / "run",
-                                   mask_scale=p.get("mask_scale", 1.0))
+                                   mask_scale=p.get("mask_scale", 1.0),
+                                   max_turn=p.get("max_turn", 0.75))
                 report = None
             final = work / "result.mp4"
             shutil.move(str(out), final)
@@ -535,6 +537,9 @@ def create_app():
         score: float = Field(0.5, ge=0.1, le=0.95)
         mask_scale: float = Field(1.0, ge=0.5, le=1.6,
                                   description="size of the mouth area taken from the model")
+        max_turn: float = Field(0.75, ge=0.1, le=2.0,
+                                description="faces turned further from the camera keep the "
+                                            "original (0 frontal .. 1 profile; 2 = sync all)")
         plan: str | None = Field(None, description="auto mode: id from "
                                  "POST /v1/assets/{id}/analyze; omit to analyze in the job")
         picks: dict[str, list[str]] | None = Field(

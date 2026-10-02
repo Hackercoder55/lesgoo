@@ -120,13 +120,31 @@ class Detector:
         self.net = cv2.FaceDetectorYN.create(str(YUNET), "", self.size, score, 0.3, 5000)
 
     def __call__(self, rgb):
+        """Also sets self.turns: how far each returned face is turned away
+        from the camera (see turn_of), in the same order."""
         small = cv2.resize(rgb, self.size, interpolation=cv2.INTER_AREA)
         _, f = self.net.detect(np.ascontiguousarray(small[:, :, ::-1]))
         if f is None:
+            self.turns = []
             return []
-        return sorted(((float(r[0] / self.k), float(r[1] / self.k),
-                        float(r[2] / self.k), float(r[3] / self.k), float(r[14]))
-                       for r in f), key=lambda b: -b[4])
+        out = sorted((((float(r[0] / self.k), float(r[1] / self.k),
+                        float(r[2] / self.k), float(r[3] / self.k), float(r[14])),
+                       turn_of(r)) for r in f), key=lambda b: -b[0][4])
+        self.turns = [t for _, t in out]
+        return [b for b, _ in out]
+
+
+def turn_of(row):
+    """0 for a face looking at the camera, about 1 for a profile, from YuNet's
+    landmarks: how far the nose sits off the eyes' midline, and how close the
+    eyes are for the face's width. The lip-sync model only knows faces
+    seen from the front; turned faces come out smeared, so they are kept."""
+    w = max(float(row[2]), 1.0)
+    rx, ry, lx, ly, nx = (float(v) for v in row[4:9])
+    eye = max(np.hypot(lx - rx, ly - ry), 1.0)
+    off = abs(nx - (rx + lx) / 2) / eye            # ~0 frontal, >0.5 well turned
+    narrow = max(0.0, 0.42 - eye / w) / 0.25       # eyes squeezed together
+    return float(min(1.5, max(off / 0.6, narrow)))
 
 
 def draw(rgb, faces, pick=None, point=None):
@@ -177,35 +195,43 @@ def prepare(video, audio, mode, dst):
     return probe(dst)
 
 
-def track(clip, m, ref_frame, start_box, score, log):
+def track(clip, m, ref_frame, start_box, score, log, max_turn=0.75):
     """Follow the chosen face through the clip, outward from the frame it
     was picked on. Frames where the detector loses it keep the last box, so
     a stylised face it only sees now and then still gets a usable track.
-    Returns one (cx, cy, w, h) per frame."""
+    Returns one (cx, cy, w, h, use) per frame; use is 0 where the face was
+    lost or turned further than max_turn, and those frames keep the original."""
     det = Detector(m["w"], m["h"], score)
-    found = [det(f) for f in frames(clip, m["w"], m["h"])]
+    found, turns = [], []
+    for f in frames(clip, m["w"], m["h"]):
+        found.append(det(f))
+        turns.append(det.turns)
     n = len(found)
     ref = min(max(ref_frame, 0), n - 1)
     out = [None] * n
+    use = [0.0] * n
     hits = 0
     for order in (range(ref, n), range(ref - 1, -1, -1)):
-        cur = start_box if order.start == ref else out[ref]
+        cur = tuple(start_box[:4]) if order.start == ref else out[ref]
         for i in order:
             cx, cy, w, h = cur
             best = None
-            for x, y, fw, fh, _ in found[i]:
+            for j, (x, y, fw, fh, _) in enumerate(found[i]):
                 d = np.hypot(x + fw / 2 - cx, y + fh / 2 - cy)
                 # it must be near where the face was and of a similar size,
                 # or it is another character
                 if d < max(w, h) * .6 and .5 < fw / max(w, 1) < 2 \
                         and (best is None or d < best[0]):
-                    best = (d, (x + fw / 2, y + fh / 2, fw, fh))
+                    best = (d, (x + fw / 2, y + fh / 2, fw, fh), j)
             if best:
                 cur = best[1]
                 hits += 1
+                use[i] = 1.0 if turns[i][best[2]] <= max_turn else 0.0
             out[i] = cur
-    log(f"tracked the face on {hits}/{n} frames (the rest hold the last position)")
-    return out
+    used = int(sum(use))
+    log(f"tracked the face on {hits}/{n} frames; lip-syncing {used} where it faces "
+        f"the camera enough (the rest keep the original)")
+    return [(*o, u) for o, u in zip(out, use)]
 
 
 def crop_box(tr, m, crop_max):
@@ -289,14 +315,17 @@ def blend(clip, m, crop_out, box, tr, dst, mask_scale=1.0):
          "-shortest", "-movflags", "+faststart", "-y", str(dst)], stdin=subprocess.PIPE)
     mf = Path(str(crop_out) + ".missed.json")
     missed = set(json.loads(mf.read_text())) if mf.exists() else set()
-    tr = smooth_track(tr)
+    # a 5th value per frame says how much of the synced mouth to use; smoothing
+    # it fades between synced and original over a few frames instead of popping
+    tr = smooth_track([tuple(t) + ((1.0,) if len(t) < 5 else ()) for t in tr], 7)
     n = 0
     for i, o in enumerate(frames(clip, W, H, "yuv444p")):
         g = next(syn, None)
         out = o.copy()
         ci = int(i / m["fps"] * LS_FPS + 1e-6)       # this frame in the model's 25 fps clip
-        if g is not None and i < len(tr) and ci not in missed:
-            cx, cy, fw, fh = tr[i]
+        if g is not None and i < len(tr) and ci not in missed and tr[i][4] > .15:
+            cx, cy, fw, fh, wgt = tr[i]
+            wgt = float(np.clip((wgt - .15) / .7, 0, 1))
             mask = np.zeros((s, s), np.uint8)
             cv2.ellipse(mask, (int(cx - x0), int(cy - y0 + fh * .22)),
                         (max(1, int(fw * .42 * mask_scale)), max(1, int(fh * .30 * mask_scale))),
@@ -304,6 +333,7 @@ def blend(clip, m, crop_out, box, tr, dst, mask_scale=1.0):
             k = int(max(fw, fh) * .12) | 1
             a = cv2.GaussianBlur(mask, (k, k), 0).astype(np.float32) / 255
             rest = a < .02
+            a *= wgt
             for c in range(3):
                 oc = o[c, y0:y0 + s, x0:x0 + s].astype(np.float32)
                 sc = g[c].astype(np.float32)
@@ -323,7 +353,8 @@ def blend(clip, m, crop_out, box, tr, dst, mask_scale=1.0):
 
 
 def lipsync(video, audio, pick, mode, engine, steps, guidance, seed, crop_max,
-            score, ls, log=print, run=None, track_=None, mask_scale=1.0):
+            score, ls, log=print, run=None, track_=None, mask_scale=1.0,
+            max_turn=0.75):
     """pick: {"t": seconds, "box": (cx, cy, w, h)} - the face to sync.
     run: folder for this job's files (default: a new one in studio_runs).
     track_: the face's (cx, cy, w, h) on every frame, when the caller has
@@ -337,7 +368,8 @@ def lipsync(video, audio, pick, mode, engine, steps, guidance, seed, crop_max,
     if track_ is not None:
         tr = [tuple(map(float, t)) for t in track_]
     else:
-        tr = track(clip, m, int(round(pick["t"] * m["fps"])), pick["box"], score, log)
+        tr = track(clip, m, int(round(pick["t"] * m["fps"])), pick["box"], score, log,
+                   max_turn)
     box = crop_box(tr, m, crop_max)
     log(f"speaker crop {box['side']}px at ({box['x']},{box['y']}) -> model at {box['size']}px")
     crop_in, crop_out = run / "crop_in.mp4", run / "crop_out.mp4"

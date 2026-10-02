@@ -29,6 +29,7 @@ DEFAULTS = {
     "mouth_gap": 0.4,       # s - pauses in mouth movement shorter than this are bridged
     "mouth_min": 0.3,       # s - shorter mouth movement is ignored
     "mouth_pad": 0.15,      # s - sync a little before and after the movement
+    "max_turn": 0.75,       # faces turned further from the camera keep the original
 }
 
 
@@ -321,7 +322,8 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
                         feat /= np.linalg.norm(feat) + 1e-6
                     except cv2.error:
                         feat = None
-            dets[pk].append((i, (x * k_, y * k_, w * k_, h * k_), act, feat, hist))
+            use = 1.0 if core.turn_of(r) <= opts["max_turn"] else 0.0
+            dets[pk].append((i, (x * k_, y * k_, w * k_, h * k_, use), act, feat, hist))
         prev = gray
 
     thr = opts["mouth_threshold"]
@@ -334,7 +336,8 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
     all_tracks = []
     for k, (a, b) in enumerate(pieces):
         tracks = []
-        for i, box, act, feat, hist in dets[k]:
+        for i, box5, act, feat, hist in dets[k]:
+            box, use = box5[:4], box5[4]
             best, bs = None, 0.3
             for t in tracks:
                 if i - t["last"] > 8 or t["last"] == i:
@@ -351,6 +354,7 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
                 best = {"boxes": {}, "acts": {}, "feats": [], "hists": []}
                 tracks.append(best)
             best["boxes"][i] = box
+            best.setdefault("use", {})[i] = use
             best["last"] = i
             if act is not None:
                 best["acts"][i] = act
@@ -375,7 +379,12 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
             present = np.zeros(n, bool)
             for i in t["boxes"]:
                 present[i - a] = True
-            moving = (sm > thr) & present
+            facing = np.zeros(n, bool)
+            for i, u in t["use"].items():
+                facing[i - a] = u > 0
+            # talking only counts where the face is turned to the camera: a
+            # turned face is not synced, so its moving frames are not either
+            moving = (sm > thr) & present & facing
             first = min(t["boxes"]) - a
             last = max(t["boxes"]) - a + 1
             runs = []
@@ -393,6 +402,7 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
                     "moving_s": round(sum(y - x for x, y in runs) / fr, 2),
                     "thumb_frame": bi, "thumb_box": [x, y, w, h],
                     "track": {str(i - a): [round(v, 1) for v in (bx + bw / 2, by + bh / 2, bw, bh)]
+                              + [t["use"][i]]
                               for i, (bx, by, bw, bh) in t["boxes"].items()}}
             faces.append(face)
             all_tracks.append({"piece": k, "fid": fid, "frames": set(t["boxes"]),

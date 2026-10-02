@@ -200,7 +200,7 @@ $('#btnGo').onclick = async () => {
   const num = (id) => parseFloat($(id).value);
   const b = {kind: state.kind, video: state.video.id, steps: num('#steps'),
              guidance: num('#guidance'), seed: num('#seed'), crop_max: num('#cropMax'),
-             score: num('#score'), mask_scale: num('#maskScale')};
+             score: num('#score'), mask_scale: num('#maskScale'), max_turn: num('#maxTurn')};
   if (state.kind === 'clip') {
     b.mode = $('#mode').value;
     if (state.audio) b.audio = state.audio.id;
@@ -233,7 +233,8 @@ function autoOpts() {
   const num = (id) => parseFloat($(id).value);
   return {threshold_db: num('#thr'), merge_gap: num('#gap'), pad_before: num('#padB'),
           pad_after: num('#padA'), scene_cut: num('#cut'),
-          characters: parseInt($('#nChars').value), mouth_threshold: num('#mouthSens')};
+          characters: parseInt($('#nChars').value), mouth_threshold: num('#mouthSens'),
+          max_turn: num('#maxTurn')};
 }
 const fmt = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, '0')}`;
 
