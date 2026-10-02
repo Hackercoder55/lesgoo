@@ -1,3 +1,48 @@
+# Lip-Sync Studio (local, sync.so-style)
+
+Upload a clip, let it find the faces (or click on the face yourself),
+get the lip-synced video back. Runs LatentSync on your own GPU - no API,
+no credits, nothing uploaded.
+
+## Setup (once, Windows / Linux, NVIDIA GPU)
+
+From the repository root:
+
+```
+conda create -y -n latentsync python=3.10.13
+conda activate latentsync
+pip install -r requirements.txt
+huggingface-cli download ByteDance/LatentSync-1.5 latentsync_unet.pt whisper/tiny.pt --local-dir checkpoints
+curl -L -o lipsync-3d/models/yunet.onnx https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+```
+
+(`mkdir lipsync-3d\models` first on Windows.) ffmpeg must be on PATH.
+
+## 1. Plain quality test - clip + audio, nothing else
+
+```
+python -m scripts.inference --unet_config_path configs/unet/stage2.yaml --inference_ckpt_path checkpoints/latentsync_unet.pt --video_path my_clip.mp4 --audio_path my_dialogue.wav --video_out_path test_out.mp4
+```
+
+This is raw LatentSync on the whole frame. Look at `test_out.mp4`: if the
+mouths on your 3D characters look right here, the app will too.
+
+## 2. The app
+
+```
+python lipsync-3d/app.py
+```
+
+Open http://127.0.0.1:7860 -> upload clip (+ optional new audio) ->
+**Detect faces** -> pick a face or click on it -> **Lip sync**.
+
+VRAM: LatentSync 1.5 (256px, `stage2.yaml`) needs about 8 GB; 1.6 (512px,
+`stage2_512.yaml` + the 1.6 checkpoint) about 18 GB. An RTX 4050 laptop has
+6 GB, so it may run out of memory - lower "Max crop size" and steps, or test
+on a bigger GPU first. Each run is kept in `lipsync-3d/studio_runs/`.
+
+---
+
 # Blender lip-sync automation
 
 Lip-syncs only the speaking parts of 3D animated shorts through

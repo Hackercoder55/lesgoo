@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """One command: video in, lip-synced video plus a QC report out.
 
-    python run.py source/video4.mp4              # plan only, costs nothing
-    python run.py source/video4.mp4 --go         # plan, then generate
-    python run.py source/video4.mp4 --go --min-face 1.0
+    python run.py source/video4.mp4              # plan only
+    python run.py source/video4.mp4 --go         # plan, then generate locally
+    python run.py source/video4.mp4 --go --engine syncso   # paid sync.so API
+    python run.py source/video4.mp4 --go --engine noop     # plumbing test, no GPU
 
 Everything this pipeline knows is enforced here rather than remembered.
 The notes below each stage say which defect the code is guarding
 against, because every one of them shipped at least once and passed the
 checks that existed at the time.
 
-What it does NOT do: retry on its own. A segment that fails QC is
-reported with its credit cost and left alone until told otherwise.
+Engines: "latentsync" (default) runs on the local GPU through
+latentsync_worker.py and costs nothing per video, so it retries a failed
+segment by itself with the next settings in LADDER. "syncso" spends
+credits, so it never retries on its own - only with --retry.
 """
 
 import argparse
 import base64
 import json
+import os
+import shutil
 import subprocess
 import sys
+import time
 import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor
@@ -29,7 +35,8 @@ import numpy as np
 
 import lipsync as L
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parent
+REPO = ROOT.parent                # LatentSync lives at the repository root
 RATE = 0.5333                     # credits per frame, sync-3, measured
 DW, DH = 540, 960                 # face-detection scale, reset per video
 FACE_SCORE = 0.6                  # YuNet confidence, --face-score
@@ -55,7 +62,7 @@ def probe(src):
     h264_trc = {"bt709": 1, "iec61966-2-1": 13, "smpte170m": 6}.get(trc, 1)
     w, h = int(s["width"]), int(s["height"])
     return {
-        "src": Path(src), "w": w, "h": h,
+        "src": Path(src).resolve(), "w": w, "h": h,
         # exact rate, not rounded: 29.97 treated as 30 drifts the spliced
         # picture against the master audio by a frame every ~33 s
         "fps": int(num) / int(den), "rate": f"{num}/{den}",
@@ -386,7 +393,7 @@ def face_image(cfg, seg, frame_number, box):
     return "data:image/webp;base64," + base64.b64encode(out).decode() if out else None
 
 
-def generate(cfg, plan, retry=False):
+def generate_syncso(cfg, plan, retry=False):
     """A segment whose synced clip from an earlier run still matches its
     frame range and passes validation is reused, not paid for again.
 
@@ -452,6 +459,200 @@ def generate(cfg, plan, retry=False):
         return [s for s, ok in ex.map(one, plan) if ok]
 
 
+# ------------------------------------------------- generate, local GPU
+
+# One entry per attempt. A local run is free, so a failed segment moves on
+# to the next entry by itself (up to --attempts) instead of waiting for
+# --retry. margin scales the crop around the speaker: wider when the face
+# detector lost the face, tighter when another face crept into the crop.
+LADDER = [
+    {"steps": 20, "guidance": 1.5, "seed": 1247, "margin": 1.0},
+    {"steps": 30, "guidance": 2.0, "seed": 4321, "margin": 1.4},
+    {"steps": 20, "guidance": 1.0, "seed": 777, "margin": 0.8},
+]
+LS_FPS = 25                       # LatentSync is trained and runs at 25 fps
+
+
+def speaker_crop(cfg, p, margin, crop_max):
+    """Square box around the speaker, in master pixels.
+
+    LatentSync syncs the biggest face it finds and gives up on the whole
+    clip if any frame has none. Cropping to the speaker named by speakers()
+    makes it the only face - the local stand-in for sync.so's
+    active_speaker_detection - and upscaling the crop gets small or
+    stylised faces past its 50x80 px minimum."""
+    W, H = cfg["w"], cfg["h"]
+    sx, sy = W / DW, H / DH
+    trk = p.get("track") or {}
+    if not trk or not p.get("face_box_small"):
+        side = min(W, H)
+        x, y = (W - side) // 2, (H - side) // 2
+    else:
+        x0, _, x1, _ = p["face_box_small"]
+        eye = (x1 - x0) / 2 * sx             # box half-width = eye distance
+        xs = [v[0] * W for v in trk.values()]
+        ys = [v[1] * H + eye * .5 for v in trk.values()]   # eyes -> face centre
+        side = margin * 5 * eye + max(max(xs) - min(xs), max(ys) - min(ys))
+        side = int(min(side, W, H)) // 2 * 2
+        x = int(np.clip((max(xs) + min(xs)) / 2 - side / 2, 0, W - side))
+        y = int(np.clip((max(ys) + min(ys)) / 2 - side / 2, 0, H - side))
+    size = int(np.clip(side, 512, crop_max)) // 2 * 2
+    return {"x": x, "y": y, "side": side, "size": size}
+
+
+def prep_crop(seg, box, dst):
+    """The speaker crop at 25 fps - LatentSync's own rate - and its size."""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(seg), "-an",
+         "-vf", f"crop={box['side']}:{box['side']}:{box['x']}:{box['y']},"
+                f"scale={box['size']}:{box['size']}:flags=lanczos,fps={LS_FPS}",
+         "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-pix_fmt", "yuv420p",
+         "-y", str(dst)], check=True)
+
+
+def uncrop(cfg, p, seg, box, crop_out, dst):
+    """Put the synced crop back into the segment at the master's frame rate,
+    exactly p["frames"] frames long, the segment's own pixels everywhere
+    else. composite() then keeps only the speaker's mouth from it."""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(seg), "-i", str(crop_out),
+         "-filter_complex",
+         f"[1:v]setpts=PTS-STARTPTS,fps={cfg['rate']},"
+         f"scale={box['side']}:{box['side']}:flags=lanczos,"
+         f"tpad=stop_mode=clone:stop_duration=2[c];"
+         f"[0:v][c]overlay={box['x']}:{box['y']}:eof_action=repeat[v]",
+         "-map", "[v]", "-map", "0:a?", "-frames:v", str(p["frames"]),
+         "-c:v", "libx264", "-crf", "12", "-preset", "medium", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", "-r", cfg["rate"],
+         "-movflags", "+faststart", "-y", str(dst)], check=True)
+
+
+def run_worker(jobs, a, log):
+    """One worker process for the whole batch: the model loads once."""
+    if a.engine == "noop":
+        # no model: hand the crop back unchanged. Proves cropping, retiming,
+        # compositing and splicing on any machine; verify() must then
+        # report NO LIPSYNC on every segment, which is the point.
+        for j in jobs:
+            shutil.copyfile(j["video"], j["out"])
+            Path(j["out"] + ".json").write_text(json.dumps(
+                {"ok": True, "error": None, "seconds": 0.0, "peak_vram_gb": 0,
+                 "settings": {k: j[k] for k in ("steps", "guidance", "seed")}}))
+        return
+    jf = log.parent / "jobs.json"
+    jf.write_text(json.dumps(jobs, indent=1))
+    cmd = [a.ls_python, str(ROOT / "latentsync_worker.py"), "--jobs", str(jf),
+           "--config", a.ls_config, "--ckpt", a.ls_ckpt]
+    if a.deepcache:
+        cmd.append("--deepcache")
+    with open(log, "a") as lf:
+        lf.write(f"\n$ {' '.join(cmd)}\n"); lf.flush()
+        pr = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        for line in pr.stdout:
+            lf.write(line)
+            if line.startswith("[worker]") or "Error" in line:
+                print("   ", line.rstrip(), flush=True)
+        pr.wait()
+    if pr.returncode:
+        print(f"    worker exited {pr.returncode}; see {log}", flush=True)
+
+
+def generate_local(cfg, plan, a):
+    """Segments that already passed are reused. A failed segment is retried
+    with the next LADDER entry, up to --attempts in this run; one that has
+    used them all is left for manual review until --retry, which continues
+    the ladder where it stopped. The original stays in place for any
+    segment that never passes."""
+    ladder = [dict(LADDER[0], **{k: v for k, v in
+                                 (("steps", a.steps), ("guidance", a.guidance),
+                                  ("seed", a.seed)) if v is not None})] + LADDER[1:]
+    log = cfg["work"] / "pipeline.log"
+    state, todo, ok = {}, [], set()
+    for p in plan:
+        sid = f"s{p['n']:02d}"
+        out = cfg["segout"] / sid
+        meta = out / "result.json"
+        prev = json.loads(meta.read_text()) if meta.exists() else {}
+        same = prev.get("final") == p["final"] and prev.get("engine") == a.engine
+        hist = prev.get("attempts", []) if same else []
+        state[sid] = {"p": p, "out": out, "meta": meta, "hist": hist}
+        if same and prev.get("ok") and (out / "synced.mp4").exists():
+            checks, _, _ = L.validate(cfg["segin"] / sid / "seg.mp4", out / "synced.mp4")
+            if all(c[2] for c in checks.values()):
+                print(f"  {sid} reusing earlier result", flush=True)
+                ok.add(sid)
+                continue
+        if hist and not a.retry:
+            print(f"  {sid} failed before ({hist[-1]['error']}) - "
+                  f"--retry to try again", flush=True)
+            continue
+        todo.append(sid)
+
+    budget = {sid: a.attempts for sid in todo}
+    while todo:
+        jobs = []
+        for sid in todo:
+            st = state[sid]
+            st["try"] = ladder[min(len(st["hist"]), len(ladder) - 1)]
+            st["box"] = speaker_crop(cfg, st["p"], st["try"]["margin"], a.crop_max)
+            st["out"].mkdir(parents=True, exist_ok=True)
+            prep_crop(cfg["segin"] / sid / "seg.mp4", st["box"], st["out"] / "crop_in.mp4")
+            (st["out"] / "crop_out.mp4.json").unlink(missing_ok=True)
+            jobs.append({"id": sid, "video": str(st["out"] / "crop_in.mp4"),
+                         "audio": str(cfg["segin"] / sid / "seg.wav"),
+                         "out": str(st["out"] / "crop_out.mp4"),
+                         **{k2: st["try"][k2] for k2 in ("steps", "guidance", "seed")}})
+        print(f"  running {a.engine} on {len(jobs)} segment(s)...", flush=True)
+        run_worker(jobs, a, log)
+
+        nxt = []
+        for sid in todo:
+            st, p = state[sid], state[sid]["p"]
+            rf = st["out"] / "crop_out.mp4.json"
+            res = json.loads(rf.read_text()) if rf.exists() else \
+                {"ok": False, "error": "worker produced no result (crashed?)"}
+            if res["ok"]:
+                try:
+                    uncrop(cfg, p, cfg["segin"] / sid / "seg.mp4", st["box"],
+                           st["out"] / "crop_out.mp4", st["out"] / "synced.mp4")
+                    checks, _, _ = L.validate(cfg["segin"] / sid / "seg.mp4",
+                                              st["out"] / "synced.mp4")
+                    bad = [k for k, c in checks.items() if not c[2]]
+                    if bad:
+                        res.update(ok=False, error=f"validation failed: {bad}")
+                except subprocess.CalledProcessError as e:
+                    res.update(ok=False, error=f"rebuild failed: {e}")
+            st["hist"].append({**st["try"], "ok": res["ok"], "error": res.get("error"),
+                               "seconds": res.get("seconds"),
+                               "peak_vram_gb": res.get("peak_vram_gb")})
+            p["crop"] = st["box"]
+            st["meta"].write_text(json.dumps(
+                {"final": p["final"], "engine": a.engine, "ok": res["ok"],
+                 "crop": st["box"], "attempts": st["hist"]}, indent=1))
+            budget[sid] -= 1
+            if res["ok"]:
+                ok.add(sid)
+                print(f"  {sid} OK (attempt {len(st['hist'])})", flush=True)
+            else:
+                more = budget[sid] > 0 and len(st["hist"]) < len(ladder)
+                print(f"  {sid} FAILED attempt {len(st['hist'])}: {res.get('error')}"
+                      f"{' - retrying with next settings' if more else ''}", flush=True)
+                if more:
+                    nxt.append(sid)
+        todo = nxt
+
+    # the compositor needs the crop of every usable segment, reused ones too
+    for sid in ok:
+        st = state[sid]
+        prev = json.loads(st["meta"].read_text())
+        st["p"]["crop"] = prev.get("crop")
+    report = {sid: {"ok": sid in ok, "attempts": st["hist"],
+                    "frames": st["p"]["frames"]} for sid, st in state.items()}
+    (cfg["work"] / "report.json").write_text(json.dumps(report, indent=1))
+    return sorted(ok), report
+
+
 # ------------------------------------------------------------ composite
 
 def composite(cfg, plan, usable):
@@ -485,6 +686,14 @@ def composite(cfg, plan, usable):
              "-b:a", "192k", "-fps_mode", "passthrough", "-y", str(dst)],
             stdin=subprocess.PIPE)
         last = np.zeros((H, W), np.float32)
+        # A local engine changed only the speaker crop: everything outside it
+        # is the original, so matching levels over the whole frame would
+        # measure nothing. Match over the crop's own unmasked pixels instead.
+        region = np.ones((H, W), bool)
+        if p.get("crop"):
+            c = p["crop"]
+            region[:] = False
+            region[c["y"]:c["y"] + c["side"], c["x"]:c["x"] + c["side"]] = True
         want, n = None, 0
         while True:
             ra, rb = A.stdout.read(frame), B.stdout.read(frame)
@@ -512,7 +721,7 @@ def composite(cfg, plan, usable):
                 cv2.ellipse(m, (int(cx), int(cy)), (int(ax), int(ay)), 0, 0, 360, 255, -1)
                 k = int(max(ax, ay) * .25) | 1
                 last = cv2.GaussianBlur(m, (k, k), 0).astype(np.float32) / 255.0
-            outside = last < 0.02
+            outside = (last < 0.02) & region
             keep = outside.sum() > 1000
             buf = bytearray()
             for c in range(3):
@@ -673,7 +882,11 @@ def verify(cfg, plan, usable):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("video")
-    ap.add_argument("--go", action="store_true", help="spend credits and build")
+    ap.add_argument("--go", action="store_true", help="generate and build")
+    ap.add_argument("--engine", choices=("latentsync", "syncso", "noop"),
+                    default="latentsync",
+                    help="latentsync: local GPU, free. syncso: paid API. "
+                         "noop: no model, tests the plumbing")
     ap.add_argument("--min-face", type=float, default=2.0,
                     help="smallest face to sync, %% of frame area")
     ap.add_argument("--min-run", type=int, default=12)
@@ -685,8 +898,30 @@ def main():
     ap.add_argument("--whisper-model", default="small",
                     help="small, medium, large-v3 - bigger misses fewer words")
     ap.add_argument("--retry", action="store_true",
-                    help="resubmit segments that failed on an earlier --go")
+                    help="try again segments that failed on an earlier --go")
+    g = ap.add_argument_group("local engine")
+    g.add_argument("--attempts", type=int, default=2,
+                   help="tries per segment in one run, each with the next "
+                        "LADDER settings (default 2)")
+    g.add_argument("--steps", type=int, help="diffusion steps, first attempt (20)")
+    g.add_argument("--guidance", type=float, help="guidance scale, first attempt (1.5)")
+    g.add_argument("--seed", type=int, help="seed, first attempt (1247)")
+    g.add_argument("--crop-max", type=int, default=768,
+                   help="largest speaker crop fed to the model, px; lower it "
+                        "on small GPUs")
+    g.add_argument("--ls-python", default=os.environ.get("LATENTSYNC_PYTHON",
+                                                         sys.executable),
+                   help="python of the LatentSync environment "
+                        "(or set LATENTSYNC_PYTHON)")
+    g.add_argument("--ls-config", default="configs/unet/stage2.yaml",
+                   help="stage2.yaml = 256px LatentSync 1.5 (8 GB); "
+                        "stage2_512.yaml = 512px LatentSync 1.6 (18 GB)")
+    g.add_argument("--ls-ckpt", default="checkpoints/latentsync_unet.pt",
+                   help="relative to the repository root")
+    g.add_argument("--deepcache", action="store_true",
+                   help="faster LatentSync, slightly lower quality")
     a = ap.parse_args()
+    paid = a.engine == "syncso"
 
     global FACE_SCORE
     FACE_SCORE = a.face_score
@@ -711,15 +946,20 @@ def main():
     (cfg["work"] / "missed.json").write_text(json.dumps(missed, indent=1))
 
     total = sum(p["frames"] for p in plan)
-    print(f"\n{'seg':6}{'time':>16}{'sec':>6}{'cr':>6}  words")
+    print(f"\n{'seg':6}{'time':>16}{'sec':>6}{'cr' if paid else '':>6}  words")
     for p in plan:
         x, b = p["final"]
+        cr = f"{p['frames']*RATE:6.0f}" if paid else " " * 6
         print(f"s{p['n']:02d}  {x/cfg['fps']:7.2f}-{(b+1)/cfg['fps']:<8.2f}"
-              f"{p['frames']/cfg['fps']:6.1f}{p['frames']*RATE:6.0f}  {p['text'][:44]}")
+              f"{p['frames']/cfg['fps']:6.1f}{cr}  {p['text'][:44]}")
     print(f"\n{len(plan)} segments, {total} frames = {total/cfg['fps']:.1f}s "
-          f"= {total*RATE:.0f} credits (${total*RATE/100:.2f})")
-    print(f"whole video would be {cfg['total']*RATE:.0f} credits "
-          f"- saving {(1-total/cfg['total'])*100:.0f}%")
+          f"of {cfg['total']/cfg['fps']:.1f}s - "
+          f"{(1-total/cfg['total'])*100:.0f}% of the video skipped")
+    if paid:
+        print(f"sync.so: {total*RATE:.0f} credits (${total*RATE/100:.2f}); "
+              f"whole video would be {cfg['total']*RATE:.0f}")
+    else:
+        print(f"engine {a.engine}: local, no credits")
 
     long_missed = [m for m in missed if m["frames"][1] - m["frames"][0] + 1 >= 3]
     if long_missed:
@@ -730,12 +970,20 @@ def main():
                   f"{m['text'][:40]}")
 
     if not a.go:
-        print("\nplan only. re-run with --go to spend credits.")
+        print("\nplan only. re-run with --go to generate"
+              + (" (spends credits)." if paid else "."))
         return
 
-    print("\n[5/7] extracting and generating")
+    print(f"\n[5/7] extracting and generating ({a.engine})")
+    t0 = time.time()
     extract_all(cfg, plan)
-    usable = set(generate(cfg, plan, a.retry))
+    report = None
+    if paid:
+        usable = set(generate_syncso(cfg, plan, a.retry))
+    else:
+        usable, report = generate_local(cfg, plan, a)
+        usable = set(usable)
+    gen_s = time.time() - t0
     (cfg["work"] / "usable.json").write_text(json.dumps(sorted(usable)))
     failed = [f"s{p['n']:02d}" for p in plan if f"s{p['n']:02d}" not in usable]
     if failed:
@@ -751,6 +999,19 @@ def main():
     print("\n[7/7] verifying")
     fails = verify(cfg, plan, usable)
     print("\n" + ("ALL CHECKS PASSED" if not fails else "FAILED: " + ", ".join(fails)))
+    if report is not None:
+        tries = [t for r in report.values() for t in r["attempts"]]
+        vram = max([t.get("peak_vram_gb") or 0 for t in tries], default=0)
+        print(f"\n  input duration      {cfg['total']/cfg['fps']:8.1f} s"
+              f"\n  speaking (planned)  {total/cfg['fps']:8.1f} s"
+              f"\n  segments synced     {len(usable):8d} / {len(plan)}"
+              f"\n  model runs          {len(tries):8d}"
+              f"  (retries {max(0, len(tries) - len(report))})"
+              f"\n  peak VRAM           {vram:8.2f} GB"
+              f"\n  generate time       {gen_s:8.0f} s"
+              f"\n  report              {cfg['work'] / 'report.json'}")
+        if failed:
+            print(f"  manual review       {', '.join(failed)}")
     print(f"\n{cfg['out']}")
 
 
