@@ -70,6 +70,29 @@ There's also a Docker image: see `deploy/Dockerfile`.
 or not anyone is using it. Stop the instance when you're done. Before you
 destroy it, download the results or keep `/workspace/lipsync_data`.
 
+## Second engine: InfiniteTalk (big GPU)
+
+LatentSync repaints only the mouth. It is fast, but it struggles with
+small, turned or stylised faces. InfiniteTalk (MeiGen-AI, Apache-2.0,
+built on Wan2.1 14B) regenerates the whole face: lips, jaw, head and
+expression follow the audio. It usually looks more natural, but it is
+much slower, and it only roughly follows the original head and camera
+movement.
+
+On the Vast machine, once:
+
+```
+cd /workspace/lesgoo && git pull
+bash lipsync-3d/webapp/deploy/infinitetalk_setup.sh
+```
+
+You need about 120 GB of free disk, because the first run downloads
+about 80 GB. An A100 or H100 80 GB is comfortable. A 24 GB GPU works too:
+the site switches InfiniteTalk to low-VRAM mode by itself, but it is
+slow. Afterwards both engines are in Settings → Engine. Choosing
+InfiniteTalk also sets "Mouth area" to Whole face and "Turned faces" to
+every frame.
+
 ## Users and passwords from the command line
 
 ```

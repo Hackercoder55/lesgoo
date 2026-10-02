@@ -22,8 +22,20 @@ const post = (p, b) => api(p, {method: 'POST', headers: {'content-type': 'applic
 // ---------------------------------------------------------------- header
 async function loadMe() {
   const me = state.me = await api('/v1/me');
-  $('#engine').textContent = me.engine === 'preview' ? 'engine: preview (no model)'
-                                                     : `engine: LatentSync ${me.model || ''}`;
+  const label = {latentsync: `LatentSync ${me.model || ''}`, infinitetalk: 'InfiniteTalk',
+                 preview: 'preview (no model)'};
+  $('#engine').textContent = 'engine: ' + (me.engines || [me.engine]).map((e) => label[e] || e).join(' + ');
+  if (!state.enginesSet && (me.engines || []).length) {
+    state.enginesSet = true;
+    $('#engineSel').innerHTML = me.engines.map((e) => `<option value="${e}">${label[e] || e}</option>`).join('');
+    $('#engineBox').hidden = me.engines.length < 2;
+    $('#engineSel').onchange = () => {
+      // InfiniteTalk moves the whole face and copes with turned heads
+      const it = $('#engineSel').value === 'infinitetalk';
+      $('#maskScale').value = it ? '2' : '1.0';
+      $('#maxTurn').value = it ? '2' : '0.75';
+    };
+  }
   $('#gpu').textContent = me.gpu_busy ? 'GPU busy' : 'GPU idle';
   $('#gpu').className = 'badge ' + (me.gpu_busy ? 'busy' : 'live');
   $('#who').textContent = me.local ? 'local mode' : me.name;
@@ -201,6 +213,7 @@ $('#btnGo').onclick = async () => {
   const b = {kind: state.kind, video: state.video.id, steps: num('#steps'),
              guidance: num('#guidance'), seed: num('#seed'), crop_max: num('#cropMax'),
              score: num('#score'), mask_scale: num('#maskScale'), max_turn: num('#maxTurn')};
+  if ($('#engineSel').value) b.engine = $('#engineSel').value;
   if (state.kind === 'clip') {
     b.mode = $('#mode').value;
     if (state.audio) b.audio = state.audio.id;

@@ -35,7 +35,8 @@ RUNS = ROOT / "studio_runs"
 DET_LONG = 960                    # detection runs with this long side
 LS_FPS = 25                       # LatentSync's own frame rate
 
-ENGINES = {"LatentSync (local GPU)": "latentsync", "Preview (no model)": "preview"}
+ENGINES = {"LatentSync (local GPU)": "latentsync", "InfiniteTalk (big GPU)": "infinitetalk",
+           "Preview (no model)": "preview"}
 MODES = {"cut - stop at the shorter of video/audio": "cut",
          "loop - repeat the video to fit the audio": "loop",
          "bounce - play video forward/back to fit the audio": "bounce"}
@@ -252,6 +253,11 @@ def run_model(engine, crop_in, wav, crop_out, steps, guidance, seed, ls, log):
         shutil.copyfile(crop_in, crop_out)
         log("preview engine: mouth left unchanged (no model run)")
         return
+    if engine == "infinitetalk":
+        sys.path.insert(0, str(ROOT))
+        import infinitetalk_engine
+        infinitetalk_engine.run(crop_in, wav, crop_out, seed, log)
+        return
     sys.path.insert(0, str(ROOT))
     import latentsync_worker as W
     import torch
@@ -327,9 +333,15 @@ def blend(clip, m, crop_out, box, tr, dst, mask_scale=1.0):
             cx, cy, fw, fh, wgt = tr[i]
             wgt = float(np.clip((wgt - .15) / .7, 0, 1))
             mask = np.zeros((s, s), np.uint8)
-            cv2.ellipse(mask, (int(cx - x0), int(cy - y0 + fh * .22)),
-                        (max(1, int(fw * .42 * mask_scale)), max(1, int(fh * .30 * mask_scale))),
-                        0, 0, 360, 255, -1)
+            if mask_scale >= 2:
+                # whole face, forehead to chin: for engines that move the
+                # head and jaw too, where a mouth-only patch would not line up
+                cv2.ellipse(mask, (int(cx - x0), int(cy - y0 + fh * .05)),
+                            (max(1, int(fw * .62)), max(1, int(fh * .66))), 0, 0, 360, 255, -1)
+            else:
+                cv2.ellipse(mask, (int(cx - x0), int(cy - y0 + fh * .22)),
+                            (max(1, int(fw * .42 * mask_scale)), max(1, int(fh * .30 * mask_scale))),
+                            0, 0, 360, 255, -1)
             k = int(max(fw, fh) * .12) | 1
             a = cv2.GaussianBlur(mask, (k, k), 0).astype(np.float32) / 255
             rest = a < .02

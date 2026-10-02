@@ -161,7 +161,7 @@ class Worker(threading.Thread):
             return not r or r["status"] == "cancelling"
 
         p = json.loads(job["params"])
-        settings = {"engine": CFG["engine"], "steps": p["steps"],
+        settings = {"engine": p.get("engine") or CFG["engine"], "steps": p["steps"],
                     "guidance": p["guidance"], "seed": p["seed"],
                     "crop_max": p["crop_max"], "score": p["score"],
                     "auto": {**(p.get("auto") or {}), "max_turn": p.get("max_turn", 0.75)},
@@ -183,7 +183,7 @@ class Worker(threading.Thread):
                 if face == "auto":
                     face = auto_face(video, p.get("face_t", 0.5), p["score"])
                     log(f"face chosen automatically at {face['t']:.2f}s")
-                out = core.lipsync(video, audio, face, p["mode"], CFG["engine"],
+                out = core.lipsync(video, audio, face, p["mode"], settings["engine"],
                                    p["steps"], p["guidance"], p["seed"], p["crop_max"],
                                    p["score"], CFG["ls"], log, run=work / "run",
                                    mask_scale=p.get("mask_scale", 1.0),
@@ -229,14 +229,39 @@ def auto_face(video, t, score):
 
 
 WORKER = Worker()
-MODEL_PROBLEMS = []
+MODEL_PROBLEMS = []      # shown as setup warnings
+ENGINES = []             # engines that can run here, default first
+
+
+def find_engines():
+    """LatentSync and/or InfiniteTalk, whichever is installed. With
+    --engine preview only the no-model engine is offered."""
+    if CFG["engine"] == "preview":
+        return ["preview"], []
+    sys.path.insert(0, str(core.ROOT))
+    import infinitetalk_engine as it
+    ok, warn = [], []
+    ls = model_problems()
+    if not ls:
+        ok.append("latentsync")
+    it_probs = it.problems()
+    if not it_probs:
+        ok.append("infinitetalk")
+    elif (it.DIR / "generate_infinitetalk.py").exists():
+        warn += it_probs                 # half installed: say what is missing
+    if CFG["engine"] in ok:
+        ok.remove(CFG["engine"])
+        ok.insert(0, CFG["engine"])
+    if CFG["engine"] == "latentsync" or not ok:
+        warn = ls + warn
+    return ok, warn
 
 
 def model_problems():
     """Why the LatentSync engine cannot run here, in plain words. Checked
     once at start, so a job fails up front instead of 'finishing' with every
     segment left as the original."""
-    if CFG["engine"] != "latentsync":
+    if CFG["engine"] == "preview":
         return []
     import importlib.util
     out = []
@@ -354,7 +379,8 @@ def create_app():
     @api.get("/v1/me")
     def me(u=Depends(user_of)):
         return {"name": u["name"], "admin": bool(u["admin"]), "local": CFG["local"],
-                "engine": CFG["engine"], "gpu_busy": WORKER.current is not None,
+                "engine": ENGINES[0] if ENGINES else CFG["engine"], "engines": ENGINES,
+                "gpu_busy": WORKER.current is not None,
                 "missing": core.missing() + MODEL_PROBLEMS,
                 "vram_gb": CFG.get("vram_gb"),
                 "model": "512px" if "512" in CFG["ls"]["config"] else "256px"}
@@ -526,6 +552,8 @@ def create_app():
 
     class JobIn(BaseModel):
         kind: str = Field("clip", pattern="^(clip|auto)$")
+        engine: str | None = Field(None, description="latentsync | infinitetalk | preview; "
+                                   "omit for the server's default")
         video: str
         audio: str | None = None
         face: Face | None = Field(None, description="omit to pick automatically")
@@ -550,8 +578,11 @@ def create_app():
 
     @api.post("/v1/jobs")
     def submit(b: JobIn, u=Depends(user_of)):
-        if MODEL_PROBLEMS:
+        if not ENGINES:
             raise HTTPException(400, "Lip sync can't run yet: " + " | ".join(MODEL_PROBLEMS))
+        if b.engine and b.engine not in ENGINES:
+            raise HTTPException(400, f"engine '{b.engine}' is not installed here "
+                                     f"(available: {', '.join(ENGINES)})")
         v = own_asset(b.video, u)
         if json.loads(v["meta"])["kind"] != "video":
             raise HTTPException(400, "'video' must be a video asset")
@@ -681,8 +712,10 @@ def main():
                     help="single-user on this PC: no login, listens on 127.0.0.1 only")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--engine", choices=("latentsync", "preview"), default="latentsync",
-                    help="preview: no model, for testing the site without a GPU")
+    ap.add_argument("--engine", choices=("latentsync", "infinitetalk", "preview"),
+                    default="latentsync",
+                    help="default engine; any other installed engine is offered too. "
+                         "preview: no model, for testing the site without a GPU")
     ap.add_argument("--ls-config", default=CFG["ls"]["config"],
                     help="stage2.yaml = 256px LatentSync 1.5 (~8 GB VRAM); "
                          "stage2_512.yaml = 512px LatentSync 1.6 (~18 GB)")
@@ -704,10 +737,10 @@ def main():
         print(f"\n  first start: created user 'admin' with password: {pw}\n"
               f"  log in and change it (or set ADMIN_PASSWORD before the first start)\n",
               flush=True)
-    MODEL_PROBLEMS[:] = model_problems()
+    ENGINES[:], MODEL_PROBLEMS[:] = find_engines()
     for m in core.missing() + MODEL_PROBLEMS:
         print(f"  !! {m}", flush=True)
-    print(f"  data folder: {DATA}\n  engine: {a.engine}\n"
+    print(f"  data folder: {DATA}\n  engines: {', '.join(ENGINES) or 'none ready'}\n"
           f"  open http://{'127.0.0.1' if a.host in ('0.0.0.0', '::') else a.host}:{a.port}",
           flush=True)
     WORKER.start()

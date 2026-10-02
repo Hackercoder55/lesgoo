@@ -52,6 +52,9 @@ mkdir -p lipsync-3d/models
 CONFIG=configs/unet/stage2.yaml
 [ "$MODEL" = "1.6" ] && CONFIG=configs/unet/stage2_512.yaml
 export LIPSYNC_DATA=${LIPSYNC_DATA:-/workspace/lipsync_data}
+# InfiniteTalk (if installed): keep only part of its 14B model on GPUs under 40 GB
+export INFINITETALK_DIR=${INFINITETALK_DIR:-/workspace/InfiniteTalk}
+if [ "${VRAM:-0}" -lt 40000 ]; then export INFINITETALK_LOWVRAM=1; else export INFINITETALK_LOWVRAM=0; fi
 pkill -f "lipsync-3d/webapp/server.py" 2>/dev/null && sleep 2
 echo "starting LatentSync $MODEL on port $PORT (data in $LIPSYNC_DATA)"
 nohup python lipsync-3d/webapp/server.py --host 0.0.0.0 --port "$PORT" \
