@@ -23,6 +23,12 @@ DEFAULTS = {
     "threshold_db": 12.0,   # dB above the noise floor that counts as speech
     "max_segment": 20.0,    # s - longer speech is split, keeps VRAM and retries small
     "scene_cut": 0.3,       # ffmpeg scene score that counts as a shot change
+    "characters": 0,        # how many characters: 0 = decide automatically
+    "max_characters": 4,    # the rest are grouped as background faces
+    "mouth_threshold": 1.6, # mouth movement vs whole-frame movement that counts as talking
+    "mouth_gap": 0.4,       # s - pauses in mouth movement shorter than this are bridged
+    "mouth_min": 0.3,       # s - shorter mouth movement is ignored
+    "mouth_pad": 0.15,      # s - sync a little before and after the movement
 }
 
 
@@ -145,14 +151,120 @@ def _iou(a, b):
     return i / (aw * ah + bw * bh - i + 1e-6)
 
 
-def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
-    """Plan a whole video: where speech is, cut into shots, and every face
-    on screen in each piece, tracked, with a guess at who is speaking.
+SFACE = core.ROOT / "models" / "sface.onnx"
 
-    The guess is mouth movement in the original render against the whole
-    frame's movement - the speaking character's mouth already moves, a
-    listener's does not. It is only the default; the site shows every face
-    so the person can choose one or several per piece."""
+
+def _face_hist(bgr, x, y, w, h):
+    """Colour signature of a face and the hair above it. Stylised 3D
+    characters are told apart by hair and skin colour far more reliably
+    than by a face-recognition model trained on photographs."""
+    import cv2
+    H, W = bgr.shape[:2]
+    x0, x1 = int(max(0, x - .2 * w)), int(min(W, x + 1.2 * w))
+    y0, y1 = int(max(0, y - .4 * h)), int(min(H, y + h))
+    roi = bgr[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [18, 8], [0, 180, 0, 256])
+    return cv2.normalize(hist, None).flatten().astype(np.float32)
+
+
+def _smooth_runs(mask, fill, min_len):
+    """[a, b) runs of True after closing gaps up to `fill` frames and
+    dropping runs shorter than `min_len`."""
+    m = mask.copy()
+    n = len(m)
+    i = 0
+    while i < n:
+        if not m[i]:
+            j = i
+            while j < n and not m[j]:
+                j += 1
+            if 0 < i and j < n and j - i <= fill:
+                m[i:j] = True
+            i = j
+        else:
+            i += 1
+    runs, i = [], 0
+    while i < n:
+        if m[i]:
+            j = i
+            while j < n and m[j]:
+                j += 1
+            if j - i >= min_len:
+                runs.append([i, j])
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def cluster_tracks(tracks, n_chars, log):
+    """Group face tracks from every shot into characters.
+
+    Distance mixes the face-recognition embedding (when the SFace model is
+    there) with the hair/skin colour signature. Two tracks on screen at the
+    same moment are never the same character. n_chars: 0 = decide from the
+    distances, else exactly that many groups (when the footage allows)."""
+    import cv2
+    n = len(tracks)
+    if n == 0:
+        return []
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = tracks[i], tracks[j]
+            if a["piece"] == b["piece"] and a["frames"] & b["frames"]:
+                d = np.inf
+            else:
+                dh = (cv2.compareHist(a["hist"], b["hist"], cv2.HISTCMP_BHATTACHARYYA)
+                      if a["hist"] is not None and b["hist"] is not None else .45)
+                if a["feat"] is not None and b["feat"] is not None:
+                    df = 1 - float(np.dot(a["feat"], b["feat"]))
+                    d = .5 * df / .65 + .5 * dh / .45
+                else:
+                    d = dh / .45
+            D[i, j] = D[j, i] = d
+    groups = [[i] for i in range(n)]
+    weight = [len(t["frames"]) for t in tracks]
+
+    def gd(g, h):
+        vals = [D[i, j] for i in g for j in h]
+        if any(np.isinf(vals)):
+            return np.inf
+        w = [weight[i] * weight[j] for i in g for j in h]
+        return float(np.average(vals, weights=w))
+
+    while len(groups) > 1:
+        best, bi, bj = np.inf, -1, -1
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                d = gd(groups[i], groups[j])
+                if d < best:
+                    best, bi, bj = d, i, j
+        if bi < 0:
+            break
+        if n_chars and len(groups) <= n_chars:
+            break
+        if not n_chars and best > 1.0:
+            break
+        groups[bi] += groups.pop(bj)
+    groups.sort(key=lambda g: -sum(weight[i] for i in g))
+    log(f"{n} face track(s) grouped into {len(groups)} character(s)")
+    return groups
+
+
+def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
+    """Plan a whole video: where speech is, cut into shots, every face on
+    screen tracked inside its shot, the tracks grouped into characters, and
+    for each track the frames where its mouth moves.
+
+    Mouth movement is measured on the original render against the whole
+    frame's movement: a talking character's mouth already moves, a listener's
+    does not. A track is synced over its mouth-moving frames only, so one
+    run of the video lip-syncs every chosen character exactly where it
+    talks - no cutting clips per character."""
     import cv2
 
     out = Path(outdir)
@@ -170,9 +282,12 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
     for k, (a, b) in enumerate(pieces):
         owner[a:b] = k
     det = core.Detector(m["w"], m["h"], score)
+    rec = cv2.FaceRecognizerSF.create(str(SFACE), "") if SFACE.exists() else None
+    if rec is None:
+        log("face-recognition model missing - characters are told apart by colour only")
     sw, sh_ = det.size
     k_ = 1 / det.k
-    dets = [[] for _ in pieces]               # per piece: (frame, box, act)
+    dets = [[] for _ in pieces]               # per piece: (frame, box, act, feat, hist)
     prev = None
     for i, f in enumerate(core.frames(video, sw, sh_, vf=f"scale={sw}:{sh_}")):
         if i >= len(owner):
@@ -185,7 +300,8 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
         if pk < 0:
             prev = None
             continue
-        _, faces = det.net.detect(np.ascontiguousarray(f[:, :, ::-1]))
+        bgr = np.ascontiguousarray(f[:, :, ::-1])
+        _, faces = det.net.detect(bgr)
         gray = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY).astype(np.int16)
         g = float(np.abs(gray - prev).mean()) if prev is not None else None
         for r in (faces if faces is not None else []):
@@ -196,14 +312,29 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
                 y0, y1 = int(max(0, y + .55 * h)), int(min(sh_, y + .95 * h))
                 if x1 > x0 and y1 > y0:
                     act = float(np.abs(gray[y0:y1, x0:x1] - prev[y0:y1, x0:x1]).mean()) / (g + 1)
-            dets[pk].append((i, (x * k_, y * k_, w * k_, h * k_), act))
+            feat = hist = None
+            if i % 5 == 0:
+                hist = _face_hist(bgr, x, y, w, h)
+                if rec is not None:
+                    try:
+                        feat = rec.feature(rec.alignCrop(bgr, r)).flatten().astype(np.float32)
+                        feat /= np.linalg.norm(feat) + 1e-6
+                    except cv2.error:
+                        feat = None
+            dets[pk].append((i, (x * k_, y * k_, w * k_, h * k_), act, feat, hist))
         prev = gray
 
+    thr = opts["mouth_threshold"]
+    fill = int(round(opts["mouth_gap"] * fr))
+    pad = int(round(opts["mouth_pad"] * fr))
+    min_len = max(8, int(round(opts["mouth_min"] * fr)))
     plan = {"video": str(video), "fps": fr, "rate": m["rate"], "total": total,
-            "width": m["w"], "height": m["h"], "opts": opts, "segments": []}
+            "duration": m["duration"], "width": m["w"], "height": m["h"],
+            "opts": opts, "segments": [], "characters": []}
+    all_tracks = []
     for k, (a, b) in enumerate(pieces):
         tracks = []
-        for i, box, act in dets[k]:
+        for i, box, act, feat, hist in dets[k]:
             best, bs = None, 0.3
             for t in tracks:
                 if i - t["last"] > 8 or t["last"] == i:
@@ -217,29 +348,61 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
                 if sc > bs:
                     best, bs = t, sc
             if best is None:
-                best = {"boxes": {}, "acts": []}
+                best = {"boxes": {}, "acts": {}, "feats": [], "hists": []}
                 tracks.append(best)
             best["boxes"][i] = box
             best["last"] = i
             if act is not None:
-                best["acts"].append(act)
+                best["acts"][i] = act
+            if feat is not None:
+                best["feats"].append(feat)
+            if hist is not None:
+                best["hists"].append(hist)
         n = b - a
         faces = []
         for t in tracks:
             if len(t["boxes"]) < max(8, .25 * n):
                 continue
             fid = f"f{len(faces) + 1}"
+            # mouth movement per frame of the piece, smoothed over ~0.25 s
+            act = np.full(n, np.nan)
+            for i, v in t["acts"].items():
+                act[i - a] = v
+            win = max(3, int(fr * .25)) | 1
+            pad_ = np.pad(act, win // 2, mode="edge")
+            sm = np.array([np.nanmean(pad_[j:j + win]) if not np.all(np.isnan(pad_[j:j + win]))
+                           else 0.0 for j in range(n)])
+            present = np.zeros(n, bool)
+            for i in t["boxes"]:
+                present[i - a] = True
+            moving = (sm > thr) & present
+            first = min(t["boxes"]) - a
+            last = max(t["boxes"]) - a + 1
+            runs = []
+            for x, y in _smooth_runs(moving, fill, min_len):
+                runs.append([max(first, x - pad), min(last, y + pad)])
             bi = max(t["boxes"], key=lambda i: t["boxes"][i][2] * t["boxes"][i][3])
             x, y, w, h = t["boxes"][bi]
-            faces.append({"id": fid, "coverage": round(len(t["boxes"]) / n, 2),
-                          "activity": round(float(np.median(t["acts"])), 3) if t["acts"] else 0.0,
-                          "thumb_frame": bi, "thumb_box": [x, y, w, h],
-                          "track": {str(i - a): [round(v, 1) for v in (bx + bw / 2, by + bh / 2, bw, bh)]
-                                    for i, (bx, by, bw, bh) in t["boxes"].items()}})
+            feat = np.mean(t["feats"], 0) if t["feats"] else None
+            if feat is not None:
+                feat /= np.linalg.norm(feat) + 1e-6
+            face = {"id": fid, "coverage": round(len(t["boxes"]) / n, 2),
+                    "activity": round(float(np.nanmedian(act)) if t["acts"] else 0.0, 3),
+                    "visible_s": round(len(t["boxes"]) / fr, 2),
+                    "moving": runs,
+                    "moving_s": round(sum(y - x for x, y in runs) / fr, 2),
+                    "thumb_frame": bi, "thumb_box": [x, y, w, h],
+                    "track": {str(i - a): [round(v, 1) for v in (bx + bw / 2, by + bh / 2, bw, bh)]
+                              for i, (bx, by, bw, bh) in t["boxes"].items()}}
+            faces.append(face)
+            all_tracks.append({"piece": k, "fid": fid, "frames": set(t["boxes"]),
+                               "feat": feat,
+                               "hist": np.mean(t["hists"], 0).astype(np.float32) if t["hists"] else None,
+                               "face": face})
         sid = f"seg{k + 1:03d}"
-        pick = [max(faces, key=lambda f: f["activity"])["id"]] if faces else []
         plan["segments"].append({"id": sid, "a": a, "b": b, "start": round(a / fr, 3),
-                                 "end": round(b / fr, 3), "faces": faces, "pick": pick})
+                                 "end": round(b / fr, 3), "faces": faces,
+                                 "pick": [f["id"] for f in faces if f["moving"]]})
         for f in faces:
             try:
                 img = core.frame_at(video, f["thumb_frame"] / fr)
@@ -253,9 +416,31 @@ def analyze(video, opts, score, outdir, log, cancelled=lambda: False):
             if crop.size:
                 cv2.imwrite(str(out / "thumbs" / f"{sid}_{f['id']}.jpg"),
                             cv2.resize(crop, (160, 160))[:, :, ::-1])
+
+    groups = cluster_tracks(all_tracks, int(opts["characters"]), log)
+    for c, g in enumerate(groups):
+        main = c < opts["max_characters"]
+        cid = f"c{c + 1}" if main else "other"
+        for i in g:
+            t = all_tracks[i]
+            t["face"]["char"] = cid
+        if not main:
+            continue
+        mem = [all_tracks[i] for i in g]
+        mem.sort(key=lambda t: -len(t["frames"]))
+        plan["characters"].append({
+            "id": cid, "name": f"Character {c + 1}",
+            "visible_s": round(sum(len(t["frames"]) for t in mem) / fr, 1),
+            "moving_s": round(sum(t["face"]["moving_s"] for t in mem), 1),
+            "tracks": [f"{plan['segments'][t['piece']]['id']}/{t['fid']}" for t in mem]})
+    if any(t["face"].get("char") == "other" for t in all_tracks):
+        plan["characters"].append({"id": "other", "name": "Others (background faces)",
+                                   "visible_s": 0, "moving_s": 0, "tracks": [
+            f"{plan['segments'][t['piece']]['id']}/{t['fid']}"
+            for t in all_tracks if t["face"].get("char") == "other"]})
     (out / "plan.json").write_text(json.dumps(plan))
-    nf = sum(len(s["faces"]) for s in plan["segments"])
-    log(f"plan: {len(plan['segments'])} piece(s), {nf} face track(s)")
+    log(f"plan: {len(plan['segments'])} piece(s), {len(all_tracks)} face track(s), "
+        f"{len([c for c in plan['characters'] if c['id'] != 'other'])} character(s)")
     return plan
 
 
@@ -288,6 +473,20 @@ def runs_of(track, n, max_gap=6, min_len=8):
             boxes.append([p + (q - p) * u for p, q in zip(track[str(lo)], track[str(hi)])])
         runs.append((a, min(b, n), boxes[:min(b, n) - a]))
     return runs
+
+
+def only_moving(runs, moving, min_len=8):
+    """Keep the parts of the on-screen runs where the mouth moves. A face
+    with no moving frames (chosen by hand) is synced wherever it is seen."""
+    if not moving:
+        return runs
+    out = []
+    for a, b, boxes in runs:
+        for x, y in moving:
+            lo, hi = max(a, x), min(b, y)
+            if hi - lo >= min_len:
+                out.append((lo, hi, boxes[lo - a:hi - a]))
+    return out
 
 
 def cut_clip(src, a, b, rate, fr, dst):
@@ -340,7 +539,7 @@ def run(video, workdir, settings, ls, log, cancelled=lambda: False,
         n = b - a
         ok_faces, errors = [], []
         for fid in names:
-            runs = runs_of(faces[fid]["track"], n)
+            runs = only_moving(runs_of(faces[fid]["track"], n), faces[fid].get("moving"))
             if not runs:
                 errors.append(f"{fid}: on screen too briefly")
                 continue

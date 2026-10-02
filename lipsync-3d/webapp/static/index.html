@@ -37,14 +37,23 @@
     </div>
 
     <div id="autoPlanBox" hidden>
-      <button id="btnAnalyze" disabled style="margin-top:12px;width:100%">Analyze video — find speech, shots and characters</button>
-      <p class="hint" id="planHint">Optional but recommended: see every speaking part and choose which character(s) to lip-sync in each. Without it, the most likely speaker is used everywhere.</p>
-      <div id="planTools" class="row" hidden style="margin-top:8px">
-        <button class="small" id="planSuggest">Use suggestions</button>
-        <button class="small" id="planAll">Select every face</button>
-        <button class="small" id="planNone">Clear all</button>
+      <div class="grid2">
+        <div><label>Characters in the video</label>
+          <select id="nChars"><option value="0">Detect automatically (up to 4)</option>
+            <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></div>
+        <div><label>Mouth-movement sensitivity</label>
+          <select id="mouthSens"><option value="1.2">High - catches small movements</option>
+            <option value="1.6" selected>Normal</option><option value="2.2">Low - only clear talking</option></select></div>
       </div>
-      <div id="plan" class="plan"></div>
+      <button id="btnAnalyze" class="primary" disabled style="margin-top:12px;width:100%">Detect characters</button>
+      <p class="hint" id="planHint">Finds every character, and where each one's mouth moves while there is dialogue. Then switch on the characters to lip-sync — no cutting clips per character.</p>
+      <div id="chars" class="chars"></div>
+      <div id="tlWrap" hidden><label>Where each character will be lip-synced</label><canvas id="tl"></canvas></div>
+      <details id="advParts" hidden>
+        <summary>Fix a part by hand (advanced)</summary>
+        <p class="hint">Every speaking part with each face in it. Click a face to force it on or off there.</p>
+        <div id="plan" class="plan"></div>
+      </details>
     </div>
 
     <div id="clipOnly">

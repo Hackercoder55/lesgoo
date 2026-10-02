@@ -100,6 +100,11 @@ if (-not (Test-Path $Yunet) -or (Get-Item $Yunet).Length -lt 100000) {
         https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
 }
 
+$Sface = "lipsync-3d\models\sface.onnx"
+if (-not (Test-Path $Sface) -or (Get-Item $Sface).Length -lt 1000000) {
+    Invoke-WebRequest -UseBasicParsing -OutFile $Sface https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
+}
+
 Say "Final check"
 & $Py -c "import diffusers, omegaconf, insightface, decord, einops, accelerate, DeepCache, soundfile, cv2, fastapi, uvicorn; print('all packages ok')"
 if ($LASTEXITCODE) { Fail "a package is missing - send a screenshot of the error above." }

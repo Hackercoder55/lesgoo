@@ -30,6 +30,9 @@ mkdir -p lipsync-3d/models
 [ -s lipsync-3d/models/yunet.onnx ] || curl -sL -o lipsync-3d/models/yunet.onnx \
   https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
 
+[ -s lipsync-3d/models/sface.onnx ] || curl -sL -o lipsync-3d/models/sface.onnx \
+  https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
+
 CONFIG=configs/unet/stage2.yaml
 [ "$MODEL" = "1.6" ] && CONFIG=configs/unet/stage2_512.yaml
 export LIPSYNC_DATA=${LIPSYNC_DATA:-/workspace/lipsync_data}

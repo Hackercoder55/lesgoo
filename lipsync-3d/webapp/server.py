@@ -477,9 +477,19 @@ def create_app():
         except Exception as e:
             shutil.rmtree(d, ignore_errors=True)
             raise HTTPException(400, core.problem(e))
-        return {"plan": pid, "fps": plan["fps"], "segments": [
+        fr = plan["fps"]
+        return {"plan": pid, "fps": fr, "duration": plan["duration"],
+                "characters": plan["characters"],
+                "segments": [
             {"id": sg["id"], "start": sg["start"], "end": sg["end"], "pick": sg["pick"],
-             "faces": [{"id": f["id"], "coverage": f["coverage"], "activity": f["activity"],
+             "faces": [{"id": f["id"], "char": f.get("char"), "coverage": f["coverage"],
+                        "activity": f["activity"], "visible_s": f["visible_s"],
+                        "moving_s": f["moving_s"],
+                        # seconds in the whole video, for the timeline
+                        "moving": [[round(sg["start"] + x / fr, 2), round(sg["start"] + y / fr, 2)]
+                                   for x, y in f["moving"]],
+                        "seen": [round(sg["start"] + int(min(map(int, f["track"]))) / fr, 2),
+                                 round(sg["start"] + (int(max(map(int, f["track"]))) + 1) / fr, 2)],
                         "thumb": f"/v1/assets/{aid}/plans/{pid}/thumbs/{sg['id']}_{f['id']}.jpg"}
                        for f in sg["faces"]]}
             for sg in plan["segments"]]}

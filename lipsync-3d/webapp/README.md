@@ -9,12 +9,15 @@ What it does:
 - **Clip mode**: one shot. The face is detected automatically, or you click on it.
   You can give a new dialogue track. If audio and video lengths differ, you
   pick cut, loop or bounce.
-- **Full video (auto)**: a whole episode. **Analyze** finds where people
-  speak, splits those parts at every shot change, and shows each character
-  on screen in each part as a thumbnail. "Talking" marks the one whose
-  mouth already moves most. Click to choose one or several characters per
-  part, then run. Only those mouths are re-synced, and the result goes back
-  into the untouched original, with the same frame count and audio.
+- **Full video (auto)**: a whole video with up to 4 characters, and no
+  clips to cut per character. **Detect characters** finds every face in
+  every shot and groups them into characters, using a face-recognition
+  model plus hair and skin colour, which works for stylised 3D characters
+  too. It also measures where each character's mouth moves while there is
+  dialogue. Switch on the characters to lip-sync and check the timeline.
+  Each one is synced only where its mouth moves, and everything else stays
+  the untouched original, with the same frame count and audio.
+  "Fix a part by hand" forces any face on or off in any part.
 - **Job queue + history**: one GPU job at a time, in order. You can cancel,
   run again, download or delete. A server restart resumes the queue.
 - **Accounts**: users and admins, plus API keys for scripts and tools.
@@ -96,7 +99,7 @@ Job fields:
 | `face` | `{"t": seconds, "box": [cx, cy, w, h]}`; leave it out to pick automatically |
 | `mode` | `cut`, `loop` or `bounce` |
 | `steps`, `guidance`, `seed`, `crop_max`, `score` | model and detector settings |
-| `auto` | speech-detection settings: `threshold_db`, `merge_gap`, `pad_before`, `pad_after`, `min_speech`, `max_segment`, `scene_cut` |
+| `auto` | speech-detection settings: `threshold_db`, `merge_gap`, `pad_before`, `pad_after`, `min_speech`, `max_segment`, `scene_cut`, `characters`, `mouth_threshold`, `mouth_gap`, `mouth_min`, `mouth_pad` |
 | `plan`, `picks` | auto mode: the `plan` id from `POST /v1/assets/{id}/analyze` and `{"seg001": ["f1", "f2"], ...}`; parts left out of `picks` use the suggestion, `[]` skips a part |
 
 ## Testing without a GPU
@@ -110,11 +113,13 @@ detection, splicing and the queue. The mouth comes back unchanged.
 
 ## Limits
 
-- A character is only tracked inside one shot, so the same person in two
-  shots shows up as two thumbnails. Choose them in each part.
-- When several faces are chosen in one part, they are all synced to the
-  same dialogue. That is right when they speak at the same time or in
-  quick turns, and wrong for a listener. Leave listeners unselected.
+- Characters are grouped automatically. If two get merged or one is
+  split, set "Characters in the video" to the right number and detect
+  again, or fix single parts by hand.
+- "Mouth moves" is measured on the original render. A character whose
+  mouth is not animated at all where it talks is not found; force it on
+  by hand in those parts. If a listener's idle animation counts as talking,
+  set the sensitivity to Low.
 - Speech is found by loudness, so loud music or effects can be taken as
   speech. Raise "Speech threshold" in Settings if that happens.
 - LatentSync's own face finder is trained on real faces, so very stylised

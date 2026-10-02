@@ -14,7 +14,9 @@ RUN huggingface-cli download ByteDance/LatentSync-1.5 latentsync_unet.pt whisper
       --local-dir /app/checkpoints \
  && mkdir -p /app/lipsync-3d/models \
  && curl -sL -o /app/lipsync-3d/models/yunet.onnx \
-      https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+      https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx \
+ && curl -sL -o /app/lipsync-3d/models/sface.onnx \
+      https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
 COPY . .
 ENV LIPSYNC_DATA=/data
 EXPOSE 8000

@@ -49,8 +49,8 @@ $('#btnOut').onclick = async () => { await post('/auth/logout'); location.href =
 // ------------------------------------------------------------------ tabs
 const hints = {
   clip: 'One shot: pick the face, optionally give new audio, get it back lip-synced.',
-  auto: 'A whole episode: speech is found automatically and only those parts are ' +
-        're-synced to the video\'s own dialogue. Everything else stays untouched.',
+  auto: 'A whole video with up to 4 characters: detect the characters once, switch on the ones ' +
+        'to lip-sync, and each is synced wherever its mouth moves during dialogue. Everything else stays untouched.',
 };
 document.querySelectorAll('.tabs button').forEach((b) => b.onclick = () => {
   document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('on', x === b));
@@ -115,7 +115,7 @@ setupDrop($('#dropVideo'), 'video', (a) => {
   $('#picker').hidden = true; $('#faceList').innerHTML = ''; $('#manualSize').hidden = true;
   $('#btnFaces').disabled = !state.video;
   $('#btnAnalyze').disabled = !state.video;
-  state.plan = null; $('#plan').innerHTML = ''; $('#planTools').hidden = true;
+  state.plan = null; $('#plan').innerHTML = ''; $('#chars').innerHTML = ''; $('#tlWrap').hidden = true; $('#advParts').hidden = true;
   $('#faceT').value = Math.min(0.5, (a.duration || 1) / 2).toFixed(1);
   // show the frame and its faces straight away in clip mode
   if (state.video && state.kind === 'clip') $('#btnFaces').click();
@@ -214,9 +214,9 @@ $('#btnGo').onclick = async () => {
     b.auto = autoOpts();
     if (state.plan) {
       b.plan = state.plan.plan;
-      b.picks = Object.fromEntries(state.plan.segments.map((s) => [s.id, [...s.chosen]]));
+      b.picks = picks();
       if (!Object.values(b.picks).some((x) => x.length)) {
-        $('#err').textContent = 'No face is selected anywhere - pick at least one.';
+        $('#err').textContent = 'Nothing would be lip-synced - switch on a character (or force a face on under "Fix a part by hand").';
         return;
       }
     }
@@ -228,60 +228,131 @@ $('#btnGo').onclick = async () => {
 };
 
 // ------------------------------------------------------- auto-mode plan
+const COLORS = {c1: '#ff6a2b', c2: '#5ea8ff', c3: '#3ccf8e', c4: '#f5b942', other: '#9298a8'};
 function autoOpts() {
   const num = (id) => parseFloat($(id).value);
   return {threshold_db: num('#thr'), merge_gap: num('#gap'), pad_before: num('#padB'),
-          pad_after: num('#padA'), scene_cut: num('#cut')};
+          pad_after: num('#padA'), scene_cut: num('#cut'),
+          characters: parseInt($('#nChars').value), mouth_threshold: num('#mouthSens')};
 }
 const fmt = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, '0')}`;
+
+// a face is synced when forced on, or when its character is on and its mouth moves
+function faceOn(s, f) {
+  const k = `${s.id}/${f.id}`;
+  if (k in state.plan.force) return state.plan.force[k];
+  return !!(state.plan.on[f.char] && f.moving.length);
+}
+function picks() {
+  return Object.fromEntries(state.plan.segments.map((s) =>
+    [s.id, s.faces.filter((f) => faceOn(s, f)).map((f) => f.id)]));
+}
 
 $('#btnAnalyze').onclick = async () => {
   if (!state.video) return;
   $('#err').textContent = '';
   $('#btnAnalyze').disabled = true;
-  $('#btnAnalyze').textContent = 'Analyzing… (about a minute per few minutes of video)';
+  $('#btnAnalyze').textContent = 'Detecting characters… (about a minute per few minutes of video)';
   try {
     const p = await post(`/v1/assets/${state.video.id}/analyze`,
                          {score: parseFloat($('#score').value) || 0.5, auto: autoOpts()});
-    p.segments.forEach((s) => { s.chosen = new Set(s.pick); });
+    p.on = Object.fromEntries(p.characters.map((c) => [c.id, c.id !== 'other']));
+    p.names = Object.fromEntries(p.characters.map((c) => [c.id, c.name]));
+    p.force = {};
     state.plan = p;
     drawPlan();
   } catch (e) { $('#err').textContent = e.message; }
   $('#btnAnalyze').disabled = false;
-  $('#btnAnalyze').textContent = 'Analyze again';
+  $('#btnAnalyze').textContent = 'Detect characters again';
 };
 
 function drawPlan() {
   const p = state.plan;
-  const withFaces = p.segments.filter((s) => s.faces.length).length;
-  const chosen = p.segments.filter((s) => s.chosen.size).length;
-  $('#planTools').hidden = false;
-  $('#planHint').textContent = `${p.segments.length} speaking part(s), ${withFaces} with faces; ` +
-    `${chosen} will be lip-synced. Click faces to choose — several per part is fine. ` +
-    `"talking" marks the character whose mouth already moves most.`;
+  const faceByKey = {};
+  p.segments.forEach((s) => s.faces.forEach((f) => { faceByKey[`${s.id}/${f.id}`] = [s, f]; }));
+  // character cards
+  $('#chars').innerHTML = p.characters.length ? p.characters.map((c) => {
+    const mine = c.tracks.map((k) => faceByKey[k]).filter(Boolean);
+    const synced = mine.filter(([s, f]) => faceOn(s, f));
+    const talk = synced.reduce((t, [, f]) => t + (f.moving.length ? f.moving_s : f.visible_s), 0);
+    const pics = c.tracks.slice(0, 5).map((k) => faceByKey[k]?.[1].thumb).filter(Boolean)
+      .map((u) => `<img src="${u}" loading="lazy" alt="">`).join('');
+    return `<div class="char ${p.on[c.id] ? '' : 'off'}" style="--c:${COLORS[c.id] || '#999'}" data-c="${c.id}">
+      <div class="top"><input value="${esc(p.names[c.id])}" data-name="${c.id}" title="rename">
+        <button class="tog ${p.on[c.id] ? 'on' : ''}" data-tog="${c.id}">${p.on[c.id] ? 'Lip-sync ON' : 'Lip-sync OFF'}</button></div>
+      <div class="pics">${pics}</div>
+      <div class="stat">${c.tracks.length} shot(s)${c.visible_s ? ` · on screen ${c.visible_s}s` : ''} · mouth moves ${c.moving_s}s · <b>will sync ${talk.toFixed(1)}s in ${synced.length} part(s)</b></div>
+    </div>`;
+  }).join('') : '<div class="empty">No faces found. Lower "Detector confidence" in Settings and detect again.</div>';
+  document.querySelectorAll('[data-tog]').forEach((b) => b.onclick = () => {
+    p.on[b.dataset.tog] = !p.on[b.dataset.tog]; drawPlan();
+  });
+  document.querySelectorAll('[data-name]').forEach((i) => i.oninput = () => {
+    p.names[i.dataset.name] = i.value; drawTimeline();
+  });
+  const total = Object.values(picks()).reduce((n, x) => n + x.length, 0);
+  $('#planHint').textContent = p.characters.length
+    ? `${p.characters.filter((c) => c.id !== 'other').length} character(s) found in ${p.segments.length} speaking part(s). ` +
+      `${total} face-part(s) will be lip-synced. Switch characters on/off; check the timeline.`
+    : 'No characters found.';
+  $('#tlWrap').hidden = !p.characters.length;
+  $('#advParts').hidden = !p.segments.length;
+  drawTimeline();
+  // advanced per-part list
   $('#plan').innerHTML = p.segments.map((s) => {
-    const top = s.faces.length ? s.faces.reduce((a, b) => (b.activity > a.activity ? b : a)).id : null;
+    const n = s.faces.filter((f) => faceOn(s, f)).length;
     return `<div class="seg" data-s="${s.id}">
-      <div class="when"><span>${fmt(s.start)} – ${fmt(s.end)}</span><span>${s.chosen.size ? s.chosen.size + ' selected' : 'skipped'}</span></div>
-      ${s.faces.length ? `<div class="faces">${s.faces.map((f) => `
-        <button class="face ${s.chosen.has(f.id) ? 'on' : ''}" data-f="${f.id}" title="on screen ${Math.round(f.coverage * 100)}% of this part">
-          <img src="${f.thumb}" loading="lazy" alt="">
-          ${f.id === top && s.faces.length > 1 ? '<i class="talk">talking</i>' : ''}
-          <span>${s.chosen.has(f.id) ? '✓ sync' : 'skip'}</span></button>`).join('')}</div>`
-        : '<div class="none">No face found here — left as the original (lower detector confidence to find stylised faces).</div>'}
+      <div class="when"><span>${fmt(s.start)} – ${fmt(s.end)}</span><span>${n ? n + ' synced' : 'not synced'}</span></div>
+      ${s.faces.length ? `<div class="faces">${s.faces.map((f) => {
+        const on = faceOn(s, f), forced = `${s.id}/${f.id}` in p.force;
+        return `<button class="face ${on ? 'on' : ''}" data-f="${f.id}" style="--c:${COLORS[f.char] || '#999'}"
+          title="${f.moving.length ? 'mouth moves ' + f.moving_s + 's' : 'mouth does not move'}${forced ? ' (set by hand)' : ''}">
+          <img src="${f.thumb}" loading="lazy" alt=""><i class="who">${esc(p.names[f.char] || '?')}</i>
+          <span>${on ? '✓ sync' : 'skip'}${forced ? ' ✎' : ''}</span></button>`;
+      }).join('')}</div>` : '<div class="none">No face found here.</div>'}
     </div>`;
   }).join('');
 }
+
+function drawTimeline() {
+  const p = state.plan, cv = $('#tl');
+  const chars = p.characters;
+  const rowH = 22, top = 18, W = cv.clientWidth || 480, H = top + rowH * chars.length + 6;
+  cv.width = W * devicePixelRatio; cv.height = H * devicePixelRatio; cv.style.height = H + 'px';
+  const g = cv.getContext('2d');
+  g.scale(devicePixelRatio, devicePixelRatio);
+  g.clearRect(0, 0, W, H);
+  const L = 90, x = (t) => L + (W - L - 8) * t / p.duration;
+  g.font = '10px sans-serif'; g.fillStyle = '#9298a8';
+  const step = p.duration > 600 ? 60 : p.duration > 120 ? 30 : p.duration > 30 ? 10 : 5;
+  for (let t = 0; t <= p.duration; t += step) { g.fillText(fmt(t).replace(/\.\d$/, ''), x(t) - 8, 11); g.fillRect(x(t), 14, 1, H - 14); }
+  chars.forEach((c, r) => {
+    const y = top + r * rowH;
+    g.fillStyle = COLORS[c.id] || '#999'; g.font = '11px sans-serif';
+    g.fillText((p.names[c.id] || c.id).slice(0, 13), 4, y + 14);
+    c.tracks.forEach((k) => {
+      const [sid, fid] = k.split('/');
+      const s = p.segments.find((z) => z.id === sid), f = s?.faces.find((z) => z.id === fid);
+      if (!f) return;
+      g.fillStyle = '#2f3442'; g.fillRect(x(f.seen[0]), y + 4, Math.max(1, x(f.seen[1]) - x(f.seen[0])), rowH - 8);
+      if (faceOn(s, f)) {
+        g.fillStyle = COLORS[c.id] || '#999';
+        (f.moving.length ? f.moving : [f.seen]).forEach(([a, b]) =>
+          g.fillRect(x(a), y + 4, Math.max(2, x(b) - x(a)), rowH - 8));
+      }
+    });
+  });
+}
+window.addEventListener('resize', () => state.plan && drawTimeline());
+
 $('#plan').onclick = (e) => {
   const b = e.target.closest('.face');
   if (!b) return;
   const s = state.plan.segments.find((x) => x.id === b.closest('.seg').dataset.s);
-  if (s.chosen.has(b.dataset.f)) s.chosen.delete(b.dataset.f); else s.chosen.add(b.dataset.f);
+  const f = s.faces.find((x) => x.id === b.dataset.f);
+  state.plan.force[`${s.id}/${f.id}`] = !faceOn(s, f);
   drawPlan();
 };
-$('#planSuggest').onclick = () => { state.plan.segments.forEach((s) => { s.chosen = new Set(s.pick); }); drawPlan(); };
-$('#planAll').onclick = () => { state.plan.segments.forEach((s) => { s.chosen = new Set(s.faces.map((f) => f.id)); }); drawPlan(); };
-$('#planNone').onclick = () => { state.plan.segments.forEach((s) => { s.chosen = new Set(); }); drawPlan(); };
 
 // ------------------------------------------------------------------ jobs
 const ago = (t) => {
