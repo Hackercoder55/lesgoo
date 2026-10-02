@@ -330,16 +330,37 @@ def lipsync(video, audio, pick, mode, engine, steps, guidance, seed, crop_max,
 
 # ------------------------------------------------------------------- ui
 
+def missing():
+    """What the app needs before it can do anything, in plain words."""
+    out = [f"'{t}' not found - install ffmpeg (Windows: winget install ffmpeg), "
+           f"then close and reopen the terminal / VS Code"
+           for t in ("ffmpeg", "ffprobe") if not shutil.which(t)]
+    if not YUNET.exists():
+        out.append(f"face model missing: {YUNET} - download it (README step)")
+    return out
+
+
+def problem(e):
+    m = missing()
+    if m:
+        return " | ".join(m)
+    return f"{type(e).__name__}: {e}"
+
+
 def build_ui(ls):
     import gradio as gr
 
     def detect(video, t, score):
         if not video:
             raise gr.Error("Upload a video first")
-        m = probe(video)
-        t = min(float(t), max(m["duration"] - 0.05, 0))
-        rgb = frame_at(video, t)
-        faces = Detector(m["w"], m["h"], score)(rgb)
+        try:
+            m = probe(video)
+            t = min(float(t), max(m["duration"] - 0.05, 0))
+            rgb = frame_at(video, t)
+            faces = Detector(m["w"], m["h"], score)(rgb)
+        except Exception as e:
+            print(f"detect failed: {type(e).__name__}: {e}", flush=True)
+            raise gr.Error(problem(e))
         st = {"video": video, "t": t, "faces": faces, "pick": 0 if faces else None,
               "point": None, "frame": rgb}
         if faces:
@@ -413,7 +434,8 @@ def build_ui(ls):
                           ENGINES[engine], int(steps), float(guidance), int(seed),
                           int(crop_max), float(score), ls, log)
         except Exception as e:
-            raise gr.Error(str(e))
+            print(f"lip sync failed: {type(e).__name__}: {e}", flush=True)
+            raise gr.Error(problem(e))
         return str(out), "\n".join(lines)
 
     with gr.Blocks(title="Lip-Sync Studio") as ui:
@@ -480,6 +502,8 @@ def main():
     a = ap.parse_args()
     # LatentSync reads configs/ and checkpoints/ relative to the repo root
     os.chdir(REPO)
+    for m in missing():
+        print(f"\n  !! {m}", flush=True)
     ls = {"config": a.ls_config, "ckpt": a.ls_ckpt, "deepcache": a.deepcache}
     # local only: no share link, nothing reachable from outside this machine
     build_ui(ls).queue().launch(server_name="127.0.0.1", server_port=a.port)
