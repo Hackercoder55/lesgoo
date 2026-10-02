@@ -226,6 +226,37 @@ def auto_face(video, t, score):
 
 
 WORKER = Worker()
+MODEL_PROBLEMS = []
+
+
+def model_problems():
+    """Why the LatentSync engine cannot run here, in plain words. Checked
+    once at start, so a job fails up front instead of 'finishing' with every
+    segment left as the original."""
+    if CFG["engine"] != "latentsync":
+        return []
+    import importlib.util
+    out = []
+    need = {"torch": "torch", "diffusers": "diffusers", "omegaconf": "omegaconf",
+            "insightface": "insightface", "decord": "decord", "einops": "einops",
+            "accelerate": "accelerate", "DeepCache": "DeepCache", "soundfile": "soundfile"}
+    gone = [pkg for mod, pkg in need.items() if importlib.util.find_spec(mod) is None]
+    if gone:
+        out.append("model not installed (missing: " + ", ".join(gone) + ") - run "
+                   "'pip install -r requirements.txt' in the repository folder, then restart")
+    else:
+        import torch
+        if not torch.cuda.is_available():
+            out.append("torch is installed without CUDA, or no NVIDIA GPU is visible - "
+                       "install the CUDA build: pip install torch==2.5.1 torchvision==0.20.1 "
+                       "--index-url https://download.pytorch.org/whl/cu121")
+    for f in (CFG["ls"]["ckpt"], "checkpoints/whisper/tiny.pt"):
+        if not (core.REPO / f).exists():
+            out.append(f"model weights missing: {f} - huggingface-cli download "
+                       f"ByteDance/LatentSync-1.5 latentsync_unet.pt whisper/tiny.pt "
+                       f"--local-dir checkpoints")
+            break
+    return out
 
 
 # ------------------------------------------------------------------ web
@@ -319,7 +350,7 @@ def create_app():
     def me(u=Depends(user_of)):
         return {"name": u["name"], "admin": bool(u["admin"]), "local": CFG["local"],
                 "engine": CFG["engine"], "gpu_busy": WORKER.current is not None,
-                "missing": core.missing()}
+                "missing": core.missing() + MODEL_PROBLEMS}
 
     class PwChange(BaseModel):
         old: str
@@ -497,6 +528,8 @@ def create_app():
 
     @api.post("/v1/jobs")
     def submit(b: JobIn, u=Depends(user_of)):
+        if MODEL_PROBLEMS:
+            raise HTTPException(400, "Lip sync can't run yet: " + " | ".join(MODEL_PROBLEMS))
         v = own_asset(b.video, u)
         if json.loads(v["meta"])["kind"] != "video":
             raise HTTPException(400, "'video' must be a video asset")
@@ -649,7 +682,8 @@ def main():
         print(f"\n  first start: created user 'admin' with password: {pw}\n"
               f"  log in and change it (or set ADMIN_PASSWORD before the first start)\n",
               flush=True)
-    for m in core.missing():
+    MODEL_PROBLEMS[:] = model_problems()
+    for m in core.missing() + MODEL_PROBLEMS:
         print(f"  !! {m}", flush=True)
     print(f"  data folder: {DATA}\n  engine: {a.engine}\n"
           f"  open http://{'127.0.0.1' if a.host in ('0.0.0.0', '::') else a.host}:{a.port}",

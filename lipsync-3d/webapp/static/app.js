@@ -106,6 +106,8 @@ setupDrop($('#dropVideo'), 'video', (a) => {
   $('#btnAnalyze').disabled = !state.video;
   state.plan = null; $('#plan').innerHTML = ''; $('#planTools').hidden = true;
   $('#faceT').value = Math.min(0.5, (a.duration || 1) / 2).toFixed(1);
+  // show the frame and its faces straight away in clip mode
+  if (state.video && state.kind === 'clip') $('#btnFaces').click();
 });
 setupDrop($('#dropAudio'), 'audio');
 

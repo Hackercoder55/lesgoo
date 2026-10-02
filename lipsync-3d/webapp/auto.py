@@ -379,6 +379,10 @@ def run(video, workdir, settings, ls, log, cancelled=lambda: False,
         spent += time.time() - t0
         synced += n / fr
     report.sort(key=lambda r: r["start"])
+    if todo_segs and not done:
+        # nothing synced: say so instead of returning the original as "done"
+        why = next((r.get("why") for r in report if r["status"] == "failed"), "")
+        raise RuntimeError(f"no part could be lip-synced - {why}"[:600])
     dst = work / "lipsynced.mp4"
     splice(video, m, total, done, dst)
     log(f"spliced {len(done)} synced piece(s) into the full video")
