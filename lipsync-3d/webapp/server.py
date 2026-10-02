@@ -168,7 +168,14 @@ class Worker(threading.Thread):
         try:
             video = asset_path(p["video"])
             if job["kind"] == "auto":
-                out, report = auto.run(video, work, settings, CFG["ls"], log, cancelled)
+                plan = None
+                if p.get("plan"):
+                    pf = plan_dir(p["video"], p["plan"]) / "plan.json"
+                    if not pf.exists():
+                        raise RuntimeError("that analysis is gone - analyze the video again")
+                    plan = json.loads(pf.read_text())
+                out, report = auto.run(video, work, settings, CFG["ls"], log, cancelled,
+                                       plan=plan, picks=p.get("picks"))
             else:
                 audio = asset_path(p["audio"]) if p.get("audio") else None
                 face = p.get("face") or "auto"
@@ -201,6 +208,12 @@ def asset_path(aid):
     if not a or not Path(a["path"]).exists():
         raise RuntimeError(f"input file {aid} is gone - upload it again")
     return Path(a["path"])
+
+
+def plan_dir(aid, pid):
+    if not pid.isalnum():
+        raise RuntimeError("bad plan id")
+    return asset_path(aid).parent / "plans" / pid
 
 
 def auto_face(video, t, score):
@@ -410,6 +423,41 @@ def create_app():
                 "faces": [{"box": [round(x), round(y), round(w), round(h)],
                            "score": round(s, 3)} for x, y, w, h, s in found]}
 
+    class AnalyzeIn(BaseModel):
+        score: float = Field(0.5, ge=0.1, le=0.95)
+        auto: dict | None = None
+
+    @api.post("/v1/assets/{aid}/analyze")
+    def analyze(aid: str, b: AnalyzeIn, u=Depends(user_of)):
+        """Find speech, shots and faces; returns pieces with every face in
+        them and a guess at the speaker, for the person to choose from.
+        Runs on the CPU and takes about a minute per few minutes of video."""
+        a = own_asset(aid, u)
+        if json.loads(a["meta"])["kind"] != "video":
+            raise HTTPException(400, "not a video")
+        pid = secrets.token_hex(6)
+        d = Path(a["path"]).parent / "plans" / pid
+        try:
+            plan = auto.analyze(a["path"], b.auto, b.score, d,
+                                lambda s: print(f"[analyze {aid}] {s}", flush=True))
+        except Exception as e:
+            shutil.rmtree(d, ignore_errors=True)
+            raise HTTPException(400, core.problem(e))
+        return {"plan": pid, "fps": plan["fps"], "segments": [
+            {"id": sg["id"], "start": sg["start"], "end": sg["end"], "pick": sg["pick"],
+             "faces": [{"id": f["id"], "coverage": f["coverage"], "activity": f["activity"],
+                        "thumb": f"/v1/assets/{aid}/plans/{pid}/thumbs/{sg['id']}_{f['id']}.jpg"}
+                       for f in sg["faces"]]}
+            for sg in plan["segments"]]}
+
+    @api.get("/v1/assets/{aid}/plans/{pid}/thumbs/{name}")
+    def thumb(aid: str, pid: str, name: str, u=Depends(user_of)):
+        a = own_asset(aid, u)
+        f = Path(a["path"]).parent / "plans" / pid / "thumbs" / Path(name).name
+        if not pid.isalnum() or not f.exists():
+            raise HTTPException(404, "no such thumbnail")
+        return FileResponse(f, media_type="image/jpeg")
+
     @api.get("/v1/assets/{aid}/preview")
     def preview(aid: str, u=Depends(user_of)):
         a = own_asset(aid, u)
@@ -439,6 +487,11 @@ def create_app():
         seed: int = 1247
         crop_max: int = Field(768, ge=256, le=2048)
         score: float = Field(0.5, ge=0.1, le=0.95)
+        plan: str | None = Field(None, description="auto mode: id from "
+                                 "POST /v1/assets/{id}/analyze; omit to analyze in the job")
+        picks: dict[str, list[str]] | None = Field(
+            None, description="auto mode: {segment id: [face ids]} to sync; segments "
+                              "left out use the analysis' guess, [] skips one")
         auto: dict | None = Field(None, description="auto-mode speech settings: "
                                   + ", ".join(auto.DEFAULTS))
 
@@ -451,6 +504,10 @@ def create_app():
             own_asset(b.audio, u)
         p = b.model_dump()
         p["face"] = {"t": b.face.t, "box": b.face.box} if b.face else None
+        if b.plan:
+            if not b.plan.isalnum() or not (Path(v["path"]).parent / "plans" / b.plan
+                                            / "plan.json").exists():
+                raise HTTPException(400, "unknown plan - analyze the video again")
         p["video_name"] = v["name"]
         jid = secrets.token_hex(8)
         q("insert into jobs (id, user_id, kind, status, params, created) "

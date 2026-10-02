@@ -303,16 +303,21 @@ def blend(clip, m, crop_out, box, tr, dst):
 
 
 def lipsync(video, audio, pick, mode, engine, steps, guidance, seed, crop_max,
-            score, ls, log=print, run=None):
+            score, ls, log=print, run=None, track_=None):
     """pick: {"t": seconds, "box": (cx, cy, w, h)} - the face to sync.
-    run: folder for this job's files (default: a new one in studio_runs)."""
+    run: folder for this job's files (default: a new one in studio_runs).
+    track_: the face's (cx, cy, w, h) on every frame, when the caller has
+    already tracked it - then pick is not used."""
     run = Path(run) if run else RUNS / time.strftime("%Y%m%d_%H%M%S")
     run.mkdir(parents=True, exist_ok=True)
     log(f"run folder: {run}")
     clip = run / "input.mp4"
     m = prepare(Path(video), Path(audio) if audio else None, mode, clip)
     log(f"clip: {m['w']}x{m['h']} @ {m['fps']:.3f} fps, {m['duration']:.2f}s")
-    tr = track(clip, m, int(round(pick["t"] * m["fps"])), pick["box"], score, log)
+    if track_ is not None:
+        tr = [tuple(map(float, t)) for t in track_]
+    else:
+        tr = track(clip, m, int(round(pick["t"] * m["fps"])), pick["box"], score, log)
     box = crop_box(tr, m, crop_max)
     log(f"speaker crop {box['side']}px at ({box['x']},{box['y']}) -> model at {box['size']}px")
     crop_in, crop_out = run / "crop_in.mp4", run / "crop_out.mp4"

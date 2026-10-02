@@ -51,18 +51,29 @@ class ImageProcessor:
         else:
             self.face_detector = FaceDetector(device=device)
 
-    def affine_transform(self, image: torch.Tensor) -> np.ndarray:
+    def detect_landmarks3(self, image):
+        """Eyebrow and nose centres, or None when no face is found."""
         if self.face_detector is None:
             raise NotImplementedError("Using the CPU for face detection is not supported")
         bbox, landmark_2d_106 = self.face_detector(image)
         if bbox is None:
-            raise RuntimeError("Face not detected")
-
+            return None
         pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)  # left eyebrow center
         pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)  # right eyebrow center
         pt_nose = np.mean(landmark_2d_106[[74, 77, 83, 86]], axis=0)  # nose center
+        return np.round([pt_left_eye, pt_right_eye, pt_nose])
 
-        landmarks3 = np.round([pt_left_eye, pt_right_eye, pt_nose])
+    def warp(self, image, landmarks3):
+        face, affine_matrix = self.restorer.align_warp_face(image.copy(), landmarks3=landmarks3, smooth=True)
+        box = [0, 0, face.shape[1], face.shape[0]]  # x1, y1, x2, y2
+        face = cv2.resize(face, (self.resolution, self.resolution), interpolation=cv2.INTER_LANCZOS4)
+        face = rearrange(torch.from_numpy(face), "h w c -> c h w")
+        return face, box, affine_matrix
+
+    def affine_transform(self, image: torch.Tensor) -> np.ndarray:
+        landmarks3 = self.detect_landmarks3(image)
+        if landmarks3 is None:
+            raise RuntimeError("Face not detected")
 
         face, affine_matrix = self.restorer.align_warp_face(image.copy(), landmarks3=landmarks3, smooth=True)
         box = [0, 0, face.shape[1], face.shape[0]]  # x1, y1, x2, y2

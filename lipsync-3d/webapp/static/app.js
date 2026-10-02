@@ -46,6 +46,7 @@ document.querySelectorAll('.tabs button').forEach((b) => b.onclick = () => {
   state.kind = b.dataset.kind;
   $('#clipOnly').hidden = state.kind !== 'clip';
   $('#autoOnly').hidden = state.kind !== 'auto';
+  $('#autoPlanBox').hidden = state.kind !== 'auto';
   $('#kindHint').textContent = hints[state.kind];
 });
 $('#kindHint').textContent = hints.clip;
@@ -102,6 +103,8 @@ setupDrop($('#dropVideo'), 'video', (a) => {
   state.faces = state.pick = state.point = null;
   $('#picker').hidden = true; $('#faceList').innerHTML = ''; $('#manualSize').hidden = true;
   $('#btnFaces').disabled = !state.video;
+  $('#btnAnalyze').disabled = !state.video;
+  state.plan = null; $('#plan').innerHTML = ''; $('#planTools').hidden = true;
   $('#faceT').value = Math.min(0.5, (a.duration || 1) / 2).toFixed(1);
 });
 setupDrop($('#dropAudio'), 'audio');
@@ -195,14 +198,77 @@ $('#btnGo').onclick = async () => {
       b.face = {t: state.faces.t, box: manualBox()};
     }
   } else {
-    b.auto = {threshold_db: num('#thr'), merge_gap: num('#gap'),
-              pad_before: num('#padB'), pad_after: num('#padA')};
+    b.auto = autoOpts();
+    if (state.plan) {
+      b.plan = state.plan.plan;
+      b.picks = Object.fromEntries(state.plan.segments.map((s) => [s.id, [...s.chosen]]));
+      if (!Object.values(b.picks).some((x) => x.length)) {
+        $('#err').textContent = 'No face is selected anywhere - pick at least one.';
+        return;
+      }
+    }
   }
   $('#btnGo').disabled = true;
   try { await post('/v1/jobs', b); await loadJobs(); }
   catch (e) { $('#err').textContent = e.message; }
   refreshGo();
 };
+
+// ------------------------------------------------------- auto-mode plan
+function autoOpts() {
+  const num = (id) => parseFloat($(id).value);
+  return {threshold_db: num('#thr'), merge_gap: num('#gap'), pad_before: num('#padB'),
+          pad_after: num('#padA'), scene_cut: num('#cut')};
+}
+const fmt = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, '0')}`;
+
+$('#btnAnalyze').onclick = async () => {
+  if (!state.video) return;
+  $('#err').textContent = '';
+  $('#btnAnalyze').disabled = true;
+  $('#btnAnalyze').textContent = 'Analyzing… (about a minute per few minutes of video)';
+  try {
+    const p = await post(`/v1/assets/${state.video.id}/analyze`,
+                         {score: parseFloat($('#score').value) || 0.5, auto: autoOpts()});
+    p.segments.forEach((s) => { s.chosen = new Set(s.pick); });
+    state.plan = p;
+    drawPlan();
+  } catch (e) { $('#err').textContent = e.message; }
+  $('#btnAnalyze').disabled = false;
+  $('#btnAnalyze').textContent = 'Analyze again';
+};
+
+function drawPlan() {
+  const p = state.plan;
+  const withFaces = p.segments.filter((s) => s.faces.length).length;
+  const chosen = p.segments.filter((s) => s.chosen.size).length;
+  $('#planTools').hidden = false;
+  $('#planHint').textContent = `${p.segments.length} speaking part(s), ${withFaces} with faces; ` +
+    `${chosen} will be lip-synced. Click faces to choose — several per part is fine. ` +
+    `"talking" marks the character whose mouth already moves most.`;
+  $('#plan').innerHTML = p.segments.map((s) => {
+    const top = s.faces.length ? s.faces.reduce((a, b) => (b.activity > a.activity ? b : a)).id : null;
+    return `<div class="seg" data-s="${s.id}">
+      <div class="when"><span>${fmt(s.start)} – ${fmt(s.end)}</span><span>${s.chosen.size ? s.chosen.size + ' selected' : 'skipped'}</span></div>
+      ${s.faces.length ? `<div class="faces">${s.faces.map((f) => `
+        <button class="face ${s.chosen.has(f.id) ? 'on' : ''}" data-f="${f.id}" title="on screen ${Math.round(f.coverage * 100)}% of this part">
+          <img src="${f.thumb}" loading="lazy" alt="">
+          ${f.id === top && s.faces.length > 1 ? '<i class="talk">talking</i>' : ''}
+          <span>${s.chosen.has(f.id) ? '✓ sync' : 'skip'}</span></button>`).join('')}</div>`
+        : '<div class="none">No face found here — left as the original (lower detector confidence to find stylised faces).</div>'}
+    </div>`;
+  }).join('');
+}
+$('#plan').onclick = (e) => {
+  const b = e.target.closest('.face');
+  if (!b) return;
+  const s = state.plan.segments.find((x) => x.id === b.closest('.seg').dataset.s);
+  if (s.chosen.has(b.dataset.f)) s.chosen.delete(b.dataset.f); else s.chosen.add(b.dataset.f);
+  drawPlan();
+};
+$('#planSuggest').onclick = () => { state.plan.segments.forEach((s) => { s.chosen = new Set(s.pick); }); drawPlan(); };
+$('#planAll').onclick = () => { state.plan.segments.forEach((s) => { s.chosen = new Set(s.faces.map((f) => f.id)); }); drawPlan(); };
+$('#planNone').onclick = () => { state.plan.segments.forEach((s) => { s.chosen = new Set(); }); drawPlan(); };
 
 // ------------------------------------------------------------------ jobs
 const ago = (t) => {
@@ -252,9 +318,10 @@ const head = (t) => `<h3>${t}<button class="small ghost" data-close>✕</button>
 
 async function showJob(id) {
   const j = await api(`/v1/jobs/${id}`);
-  const rep = j.report ? `<h4>Segments</h4><table><tr><th>Segment</th><th>Time</th><th>Status</th><th></th></tr>${
+  const rep = j.report ? `<h4>Segments</h4><table><tr><th>Segment</th><th>Time</th><th>Faces</th><th>Status</th><th></th></tr>${
     j.report.map((r) => `<tr><td>${r.segment}</td><td>${r.start.toFixed(2)}–${r.end.toFixed(2)}s</td>
-      <td><span class="pill ${r.status === 'synced' ? 'done' : r.status === 'failed' ? 'failed' : 'cancelled'}">${r.status}</span></td>
+      <td>${esc((r.faces || []).join(', '))}</td>
+      <td><span class="pill ${r.status === 'synced' ? 'done' : r.status === 'failed' ? 'failed' : r.status === 'partly synced' ? 'running' : 'cancelled'}">${r.status}</span></td>
       <td>${esc(r.why || '')}</td></tr>`).join('')}</table>` : '';
   modal(head(esc(j.video_name)) +
     (j.result_url ? `<video src="${j.result_url}" controls autoplay></video>

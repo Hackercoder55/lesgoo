@@ -254,8 +254,19 @@ class LipsyncPipeline(DiffusionPipeline):
         boxes = []
         affine_matrices = []
         print(f"Affine transforming {len(video_frames)} faces...")
-        for frame in tqdm.tqdm(video_frames):
-            face, box, affine_matrix = self.image_processor.affine_transform(frame)
+        # A frame where the detector misses the face (a turn, a blink, a
+        # stylised character) borrows the landmarks of the nearest frame
+        # that has one, instead of failing the whole clip.
+        lmks = [self.image_processor.detect_landmarks3(f) for f in tqdm.tqdm(video_frames)]
+        found = [i for i, l in enumerate(lmks) if l is not None]
+        if not found:
+            raise RuntimeError("Face not detected")
+        missed = len(lmks) - len(found)
+        if missed:
+            print(f"Face missed on {missed}/{len(lmks)} frames; using the nearest detected frame's landmarks")
+        for i, frame in enumerate(video_frames):
+            l = lmks[i] if lmks[i] is not None else lmks[min(found, key=lambda j: abs(j - i))]
+            face, box, affine_matrix = self.image_processor.warp(frame, l)
             faces.append(face)
             boxes.append(box)
             affine_matrices.append(affine_matrix)

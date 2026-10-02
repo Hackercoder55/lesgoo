@@ -9,9 +9,12 @@ What it does:
 - **Clip mode**: one shot. The face is detected automatically, or you click on it.
   You can give a new dialogue track. If audio and video lengths differ, you
   pick cut, loop or bounce.
-- **Full video (auto)**: a whole episode. It finds where people speak and
-  lip-syncs only those parts. It then puts them back into the untouched
-  original, with the same frame count and the original audio.
+- **Full video (auto)**: a whole episode. **Analyze** finds where people
+  speak, splits those parts at every shot change, and shows each character
+  on screen in each part as a thumbnail. "Talking" marks the one whose
+  mouth already moves most. Click to choose one or several characters per
+  part, then run. Only those mouths are re-synced, and the result goes back
+  into the untouched original, with the same frame count and audio.
 - **Job queue + history**: one GPU job at a time, in order. You can cancel,
   run again, download or delete. A server restart resumes the queue.
 - **Accounts**: users and admins, plus API keys for scripts and tools.
@@ -82,7 +85,8 @@ Job fields:
 | `face` | `{"t": seconds, "box": [cx, cy, w, h]}`; leave it out to pick automatically |
 | `mode` | `cut`, `loop` or `bounce` |
 | `steps`, `guidance`, `seed`, `crop_max`, `score` | model and detector settings |
-| `auto` | speech-detection settings: `threshold_db`, `merge_gap`, `pad_before`, `pad_after`, `min_speech`, `max_segment` |
+| `auto` | speech-detection settings: `threshold_db`, `merge_gap`, `pad_before`, `pad_after`, `min_speech`, `max_segment`, `scene_cut` |
+| `plan`, `picks` | auto mode: the `plan` id from `POST /v1/assets/{id}/analyze` and `{"seg001": ["f1", "f2"], ...}`; parts left out of `picks` use the suggestion, `[]` skips a part |
 
 ## Testing without a GPU
 
@@ -95,9 +99,11 @@ detection, splicing and the queue. The mouth comes back unchanged.
 
 ## Limits
 
-- Auto mode syncs one face per speech stretch: the most confident one. If
-  two characters talk inside the same stretch, check those spots, or cut
-  them as separate clips.
+- A character is only tracked inside one shot, so the same person in two
+  shots shows up as two thumbnails. Choose them in each part.
+- When several faces are chosen in one part, they are all synced to the
+  same dialogue. That is right when they speak at the same time or in
+  quick turns, and wrong for a listener. Leave listeners unselected.
 - Speech is found by loudness, so loud music or effects can be taken as
   speech. Raise "Speech threshold" in Settings if that happens.
 - LatentSync's own face finder is trained on real faces, so very stylised
