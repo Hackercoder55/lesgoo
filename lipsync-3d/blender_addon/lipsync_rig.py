@@ -9,9 +9,9 @@
 # face never warps, whatever the camera or the head does.
 
 bl_info = {
-    "name": "Lip-Sync Rig",
+    "name": "Lip-Sync Rig (1.1 - Character Creator)",
     "author": "Lip-Sync Studio",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar > Lip Sync",
     "description": "Keyframe mouth shape keys from dialogue audio (Rhubarb Lip Sync), "
