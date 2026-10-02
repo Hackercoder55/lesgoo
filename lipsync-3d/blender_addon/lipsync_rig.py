@@ -55,6 +55,23 @@ SHAPE_HELP = {
 # shape to {shape key name: value}; names are matched case-insensitively and
 # ignoring "_", "." and spaces, so "Jaw_Open" finds "jawOpen".
 PRESETS = [
+    ("Character Creator 4 (V_Open, V_Explosive...)", {
+        "A": {"V_Explosive": 1}, "B": {"V_Wide": .45, "V_Lip_Open": .35},
+        "C": {"V_Open": .45, "V_Wide": .35}, "D": {"V_Open": 1},
+        "E": {"V_Tight_O": .6, "V_Open": .3}, "F": {"V_Tight_O": 1},
+        "G": {"V_Dental_Lip": 1}, "H": {"V_Open": .5, "V_Lip_Open": .3}, "X": {},
+    }),
+    ("Character Creator 4 direct (AE, AH, B_M_P...)", {
+        "A": {"B_M_P": 1}, "B": {"S_Z": .7, "EE": .3}, "C": {"AE": 1}, "D": {"AH": 1},
+        "E": {"Oh": .7, "Er": .3}, "F": {"W_OO": 1}, "G": {"F_V": 1}, "H": {"T_L_D_N": 1},
+        "X": {},
+    }),
+    ("Character Creator 3 / iClone (Open, Explosive, Tight-O...)", {
+        "A": {"Explosive": 1}, "B": {"Wide": .45, "Lip_Open": .35},
+        "C": {"Open": .45, "Wide": .35}, "D": {"Open": 1},
+        "E": {"Tight-O": .6, "Open": .3}, "F": {"Tight-O": 1},
+        "G": {"Dental_Lip": 1}, "H": {"Open": .5, "Lip_Open": .3}, "X": {},
+    }),
     ("ARKit / Apple (jawOpen, mouthFunnel...)", {
         "A": {"mouthClose": .6, "mouthPressLeft": .5, "mouthPressRight": .5},
         "B": {"jawOpen": .12, "mouthStretchLeft": .25, "mouthStretchRight": .25},
@@ -100,7 +117,7 @@ def _keys_of(obj):
     return {kb.name: kb for kb in sk.key_blocks} if sk else {}
 
 
-def auto_mapping(obj):
+def auto_mapping(obj, with_score=False):
     """(preset name, {shape: {real key: value}}) for the preset that finds
     the most of its keys on this object, or (None, {})."""
     keys = _keys_of(obj)
@@ -122,7 +139,36 @@ def auto_mapping(obj):
             mapping = {s: {found[k]: v for k, v in d.items() if k in found}
                        for s, d in recipe.items()}
             best = (score, name, mapping)
-    return best[1], best[2]
+    return best if with_score else (best[1], best[2])
+
+
+def _rig_of(obj):
+    for m in getattr(obj, "modifiers", []):
+        if m.type == "ARMATURE" and m.object:
+            return m.object
+    return obj.parent
+
+
+def followers(obj):
+    """Other meshes of the same character - beard, moustache, teeth, tongue,
+    eyelashes - that have shape keys with the same names. Keying them in step
+    keeps a beard on the lip instead of floating while the mouth moves."""
+    rig = _rig_of(obj)
+    if rig is None:
+        return []
+    return [o for o in bpy.data.objects
+            if o is not obj and o.type == "MESH" and _rig_of(o) is rig and _keys_of(o)]
+
+
+def face_mesh(obj):
+    """The mesh of this character that carries the mouth shapes - so picking
+    the moustache or a shirt still finds the head (CC_Base_Body...)."""
+    best = (auto_mapping(obj, True)[0], obj)
+    for o in followers(obj):
+        sc = auto_mapping(o, True)[0]
+        if sc > best[0]:
+            best = (sc, o)
+    return best[1]
 
 
 def mapping_to_text(d):
@@ -322,6 +368,9 @@ class LSR_Character(bpy.types.PropertyGroup):
     range_start: IntProperty(name="From", default=1)
     range_end: IntProperty(name="To", default=250)
     preset: StringProperty(name="Detected rig")
+    follow: BoolProperty(name="Move beard / teeth / tongue too", default=True,
+                         description="Also key the same shape keys on the character's other "
+                                     "meshes (beard, moustache, teeth, tongue, eyelashes)")
     show_map: BoolProperty(name="Mouth shapes", default=False)
     status: StringProperty()
 
@@ -361,6 +410,8 @@ class LSR_OT_add(bpy.types.Operator):
         c.start_frame = sc.frame_start
         c.range_start, c.range_end = sc.frame_start, sc.frame_end
         ob = context.active_object
+        if ob and ob.type == "MESH":
+            ob = face_mesh(ob)          # the moustache was selected -> use the head
         if ob and _obj_poll(None, ob) and ob not in [x.obj for x in sc.lsr_chars]:
             c.obj = ob
             bpy.ops.lipsync_rig.auto_map(index=len(sc.lsr_chars) - 1)
@@ -480,9 +531,21 @@ class LSR_OT_generate(bpy.types.Operator):
         sc = context.scene
         fps = sc.render.fps / sc.render.fps_base
         rng = (c.range_start, c.range_end) if c.use_range else None
-        n = apply_cues(c.obj, cues, char_mapping(c), st["frame0"], fps, c.intensity, rng)
+        mapping = char_mapping(c)
+        n = apply_cues(c.obj, cues, mapping, st["frame0"], fps, c.intensity, rng)
+        moved = []
+        if c.follow:
+            for o in followers(c.obj):
+                have = _keys_of(o)
+                sub = {s: {k: v for k, v in d.items() if k in have} for s, d in mapping.items()}
+                if any(sub.values()):
+                    n += apply_cues(o, cues, sub, st["frame0"], fps, c.intensity, rng)
+                    moved.append(o.name)
         talk = sum(1 for q in cues if q[2] not in "X")
-        c.status = f"done: {talk} mouth shapes, {n} keys"
+        c.status = f"done: {talk} mouth shapes, {n} keys" + \
+            (f", +{len(moved)} meshes (beard/teeth...)" if moved else "")
+        if moved:
+            print("Lip-Sync Rig: also keyed", ", ".join(moved))
         return c.status
 
     def execute(self, context):
@@ -597,6 +660,7 @@ class LSR_PT_panel(bpy.types.Panel):
             box.prop(c, "language")
             box.prop(c, "dialog")
             box.prop(c, "intensity", slider=True)
+            box.prop(c, "follow")
             r = box.row(align=True)
             r.prop(c, "use_range")
             if c.use_range:

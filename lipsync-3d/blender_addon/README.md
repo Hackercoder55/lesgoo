@@ -22,7 +22,7 @@ audio, or shares one track and is limited to a frame range.
 1. Select a character mesh that has mouth shape keys, then click **+**.
 2. The add-on detects the shape keys by name: ARKit (`jawOpen`,
    `mouthFunnel`…), Oculus / ReadyPlayerMe / Character Creator
-   (`viseme_aa`…), VRChat (`vrc.v_aa`…), Preston Blair (`AI`, `E`, `O`,
+   (`viseme_aa`…), **Character Creator 4 / 3 / iClone** (`V_Open`, `V_Explosive`…, `AE`, `B_M_P`…), VRChat (`vrc.v_aa`…), Preston Blair (`AI`, `E`, `O`,
    `MBP`…), or keys named `A`…`X`. If your names differ, open **Mouth
    shapes** and type them in, e.g. `JawOpen:0.6, LipsFunnel:0.3`.
 3. Pick the audio: a file plus its start frame, or a **sound strip** from
@@ -34,6 +34,15 @@ audio, or shares one track and is limited to a frame range.
 
 Running it again replaces that character's earlier lip-sync keys in the
 same frames; it does not pile new ones on top.
+
+## Beard, moustache, teeth, tongue
+
+Character Creator characters are split into several meshes, and the beard,
+moustache, teeth, tongue and eyelashes carry the same shape-key names as the
+head. With **Move beard / teeth / tongue too** ticked (the default), every
+mesh bound to the same rig gets the same keys, so a moustache stays on the
+lip. If you select the moustache or a shirt and click **+**, the add-on
+picks the head mesh (e.g. `CC_Base_Body`) by itself.
 
 ## Several characters, one audio track
 
