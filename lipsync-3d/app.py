@@ -107,7 +107,9 @@ def frame_at(path, t):
 
 class Detector:
     """YuNet at the frame's own aspect ratio. Boxes come back in full-size
-    pixels as (x, y, w, h, score)."""
+    pixels as (x, y, w, h, score), most confident first - not biggest
+    first: a loose false detection on the background is often the biggest
+    box, and picking it by default synced a wall."""
 
     def __init__(self, w, h, score=0.5):
         if not YUNET.exists():
@@ -124,7 +126,7 @@ class Detector:
             return []
         return sorted(((float(r[0] / self.k), float(r[1] / self.k),
                         float(r[2] / self.k), float(r[3] / self.k), float(r[14]))
-                       for r in f), key=lambda b: -b[2] * b[3])
+                       for r in f), key=lambda b: -b[4])
 
 
 def draw(rgb, faces, pick=None, point=None):
@@ -364,7 +366,7 @@ def build_ui(ls):
         st = {"video": video, "t": t, "faces": faces, "pick": 0 if faces else None,
               "point": None, "frame": rgb}
         if faces:
-            msg = (f"Found {len(faces)} face(s). Face 1 (largest) is selected - pick "
+            msg = (f"Found {len(faces)} face(s). Face 1 (most confident) is selected - pick "
                    f"another below, or click on the image to choose a face yourself.")
         else:
             msg = ("No face detected on this frame. Click on the character's "
@@ -373,6 +375,24 @@ def build_ui(ls):
         return (draw(rgb, faces, st["pick"]), st,
                 gr.update(choices=[f"Face {i+1}" for i in range(len(faces))],
                           value="Face 1" if faces else None), msg)
+
+    def make_preview(video):
+        if not video:
+            return None
+        try:
+            m = probe(video)
+            if "w" not in m:
+                raise RuntimeError("this file has no video stream")
+            dst = RUNS / "previews" / (Path(video).stem + "_preview.mp4")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            sh(["ffmpeg", "-v", "error", "-i", str(video), "-map", "0:v:0",
+                "-map", "0:a:0?", "-vf", "scale=-2:'min(720,ih)'",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-y", str(dst)])
+            return str(dst)
+        except Exception as e:
+            print(f"preview failed: {type(e).__name__}: {e}", flush=True)
+            raise gr.Error(problem(e))
 
     def manual_box(st, size_pct):
         h = st["frame"].shape[0] * size_pct / 100
@@ -445,7 +465,14 @@ def build_ui(ls):
         st = gr.State()
         with gr.Row():
             with gr.Column():
-                video = gr.Video(label="Video clip", sources=["upload"])
+                # a File, not a Video: renders from 3D tools are often
+                # HEVC / ProRes / .mov, which the browser cannot play and
+                # gr.Video then rejects. ffmpeg reads them all; the preview
+                # below is an H.264 copy made only for viewing.
+                video = gr.File(label="Video clip (mp4, mov, mkv, avi, webm...)",
+                                file_types=["video", ".mov", ".mkv", ".avi",
+                                            ".webm", ".mp4"], type="filepath")
+                preview = gr.Video(label="Preview", interactive=False, height=360)
                 audio = gr.Audio(label="New dialogue audio (optional - empty "
                                  "re-syncs to the clip's own sound)", type="filepath")
                 with gr.Row():
@@ -481,6 +508,7 @@ def build_ui(ls):
             result = gr.Video(label="Lip-synced result")
             logbox = gr.Textbox(label="Log", lines=10)
 
+        video.upload(make_preview, [video], [preview])
         btn_detect.click(detect, [video, t, score], [frame, st, which, info])
         which.input(choose, [st, which, size_pct], [frame, st])
         frame.select(click, [st, size_pct], [frame, st, which, info])
