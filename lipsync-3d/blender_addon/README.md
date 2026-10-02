@@ -61,3 +61,47 @@ no range is needed.
   (no shape keys) needs shape keys or drivers on top first.
 - **Strength** scales every shape. Lower it for subtle characters and
   raise it for cartoon ones.
+
+---
+
+# Studio Recorder — collecting training data from your animators
+
+`studio_recorder.py` is a second add-on. It is installed on every
+animator's Blender and quietly records **how they animate**, so that an
+animation model can later be trained on the studio's own work.
+
+It records Blender data only, never the screen, camera or microphone:
+
+| When | What |
+|---|---|
+| every save (only if the animation changed) | the full animation: every animated bone, shape key and property, with every keyframe, interpolation and handles |
+| **Mark shot final** button | the same, labelled as the approved take |
+| always, with each snapshot | shot id and script line (typed in the panel), dialogue sound strips, text strips, markers, cameras, linked character assets, fps, frame range |
+| every 5 s | the Blender tools used (keyframe insert, rotate, graph-editor tools, …), in order |
+| every minute | whether the file is being worked on, which gives the time spent per shot |
+
+Data goes to one `.jsonl.gz` file per animator per day. Set the folder in
+the add-on preferences; a shared network folder gathers everyone's data
+in one place.
+
+## Setup on each animator's PC
+
+1. Install `studio_recorder.py` like any add-on and tick **Studio Recorder**.
+2. In its preferences, set **Data folder** (e.g. `\\server\StudioData`) and
+   **Animator name**.
+3. In the 3D View, press N and open the **Recorder** tab. For each shot,
+   type the **Shot** id and the **Script line**. When the shot is approved,
+   click **Mark shot final**.
+
+**Tell your animators about it.** The panel shows "Recording" or "Paused",
+and they can pause it at any time.
+
+## Old finished projects (data you already have)
+
+```
+python harvest_all.py "C:\Projects\Episodes" "D:\StudioData" --blender "C:\Program Files\Blender Foundation\Blender 4.2\blender.exe"
+```
+
+This takes one snapshot of every animated scene in every `.blend` file
+under the folder. Files already harvested are skipped, so it can be
+re-run as projects grow.
