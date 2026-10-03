@@ -9,9 +9,9 @@
 # face never warps, whatever the camera or the head does.
 
 bl_info = {
-    "name": "Lip-Sync Rig (1.1 - Character Creator)",
+    "name": "Lip-Sync Rig (1.2)",
     "author": "Lip-Sync Studio",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar > Lip Sync",
     "description": "Keyframe mouth shape keys from dialogue audio (Rhubarb Lip Sync), "
@@ -117,6 +117,47 @@ def _keys_of(obj):
     return {kb.name: kb for kb in sk.key_blocks} if sk else {}
 
 
+# Expression keys by meaning, for rigs whose names match no preset exactly
+# (Character Creator "Extended" Mouth_Funnel_Up_L, Daz, Mixamo, custom...).
+# A key belongs to a concept when its name contains all of the words.
+CONCEPTS = {
+    "jaw":     [["jaw", "open"], ["mouth", "open"]],
+    "close":   [["mouth", "close"]],
+    "funnel":  [["funnel"]],
+    "pucker":  [["pucker"], ["kiss"]],
+    "press":   [["mouth", "press"], ["lips", "press"]],
+    "stretch": [["mouth", "stretch"], ["mouth", "wide"]],
+    "rolllow": [["roll", "lower"], ["roll", "in", "lower"], ["lower", "lip", "in"]],
+    "upperup": [["upper", "up"], ["up", "upper"], ["upper", "lip", "raise"]],
+}
+CONCEPT_RECIPE = {
+    "A": {"close": .7, "press": .5}, "B": {"jaw": .12, "stretch": .3},
+    "C": {"jaw": .35, "stretch": .25}, "D": {"jaw": .65},
+    "E": {"jaw": .3, "funnel": .5}, "F": {"jaw": .1, "pucker": .8, "funnel": .3},
+    "G": {"jaw": .08, "rolllow": .6, "upperup": .3}, "H": {"jaw": .4, "stretch": .1},
+    "X": {},
+}
+
+
+def concept_mapping(obj):
+    """(concepts found, mapping) built from what the shape keys are called."""
+    keys = list(_keys_of(obj))
+    found = {}
+    for c, alts in CONCEPTS.items():
+        hits = []
+        for k in keys:
+            n = _norm(k)
+            if any(all(w in n for w in alt) for alt in alts):
+                hits.append(k)
+        if c == "jaw":                  # one jaw key is enough; prefer jaw_open
+            hits = sorted(hits, key=lambda k: "jaw" not in _norm(k))[:1]
+        if hits:
+            found[c] = hits
+    mapping = {s: {k: v for c, v in d.items() for k in found.get(c, [])}
+               for s, d in CONCEPT_RECIPE.items()}
+    return len(found), mapping
+
+
 def auto_mapping(obj, with_score=False):
     """(preset name, {shape: {real key: value}}) for the preset that finds
     the most of its keys on this object, or (None, {})."""
@@ -139,6 +180,12 @@ def auto_mapping(obj, with_score=False):
             mapping = {s: {found[k]: v for k, v in d.items() if k in found}
                        for s, d in recipe.items()}
             best = (score, name, mapping)
+    # a full viseme set wins; otherwise, when the rig has real lip shapes
+    # (funnel, pucker, press...) use them rather than only opening the jaw
+    if best[0] < 0.75 or (best[1] or "").startswith("Single"):
+        nc, cm = concept_mapping(obj)
+        if nc >= 3:
+            best = (0.74 + nc / 100, f"Expression keys ({nc} lip shapes found)", cm)
     return best if with_score else (best[1], best[2])
 
 
