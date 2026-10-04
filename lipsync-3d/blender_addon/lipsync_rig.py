@@ -9,9 +9,9 @@
 # face never warps, whatever the camera or the head does.
 
 bl_info = {
-    "name": "Lip-Sync Rig (1.2)",
+    "name": "Lip-Sync Rig (1.3.1)",
     "author": "Lip-Sync Studio",
-    "version": (1, 2, 0),
+    "version": (1, 3, 1),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar > Lip Sync",
     "description": "Keyframe mouth shape keys from dialogue audio (Rhubarb Lip Sync), "
@@ -22,6 +22,7 @@ bl_info = {
 import json
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -207,15 +208,19 @@ def followers(obj):
             if o is not obj and o.type == "MESH" and _rig_of(o) is rig and _keys_of(o)]
 
 
+def _mouth_key_count(o):
+    """How many of this mesh's shape keys drive the mouth - the head has
+    dozens, a beard or moustache only a few."""
+    _, mapping = auto_mapping(o)
+    used = {k for d in mapping.values() for k in d}
+    return max(len(used), sum(len(v) for v in arkit_targets(o).values()))
+
+
 def face_mesh(obj):
     """The mesh of this character that carries the mouth shapes - so picking
     the moustache or a shirt still finds the head (CC_Base_Body...)."""
-    best = (auto_mapping(obj, True)[0], obj)
-    for o in followers(obj):
-        sc = auto_mapping(o, True)[0]
-        if sc > best[0]:
-            best = (sc, o)
-    return best[1]
+    cands = [obj] + followers(obj)
+    return max(cands, key=lambda o: (_mouth_key_count(o), o is obj))
 
 
 def mapping_to_text(d):
@@ -370,6 +375,120 @@ def apply_cues(obj, cues, mapping, start_frame, fps, intensity=1.0, rng=None,
     return n
 
 
+# ------------------------------------------------------ studio AI model
+
+MOUTH_ARKIT = ("jaw", "mouth", "cheekPuff")
+
+
+def _words(arkit):
+    w = re.findall(r"[A-Z]?[a-z]+", arkit)
+    return [x.lower() for x in w]
+
+
+def arkit_targets(obj):
+    """{ARKit mouth channel: [shape keys on this mesh]} - exact ARKit names, or
+    the same words in another order / with _L _R (Character Creator's
+    Mouth_Press_L, Mouth_Roll_In_Lower_R, Mouth_Funnel_Up_L...)."""
+    keys = list(_keys_of(obj))
+    norm = {k: _norm(k) for k in keys}
+    out = {}
+    for a in _studio_names:
+        if not a.startswith(MOUTH_ARKIT):
+            continue
+        words = _words(a)
+        side = words[-1] if words[-1] in ("left", "right") else None
+        core = [w for w in words if w not in ("left", "right")]
+        hits = []
+        for k, n in norm.items():
+            if n == _norm(a):
+                hits = [k]
+                break
+            if not all(w in n for w in core):
+                continue
+            if side and not (n.endswith(side[0]) or side in n):
+                continue
+            hits.append(k)
+        if hits:
+            out[a] = hits
+    return out
+
+
+_studio_names = [
+    "jawForward", "jawLeft", "jawOpen", "jawRight", "mouthClose", "mouthDimpleLeft",
+    "mouthDimpleRight", "mouthFrownLeft", "mouthFrownRight", "mouthFunnel", "mouthLeft",
+    "mouthLowerDownLeft", "mouthLowerDownRight", "mouthPressLeft", "mouthPressRight",
+    "mouthPucker", "mouthRight", "mouthRollLower", "mouthRollUpper", "mouthShrugLower",
+    "mouthShrugUpper", "mouthSmileLeft", "mouthSmileRight", "mouthStretchLeft",
+    "mouthStretchRight", "mouthUpperUpLeft", "mouthUpperUpRight", "cheekPuff",
+]
+
+
+def apply_curves(obj, names, frames, targets, start_frame, intensity=1.0, rng=None):
+    """Key per-frame model values (names x frames) onto the mapped shape keys.
+    Earlier keys of those shape keys in the span are replaced. Returns key count."""
+    keys = _keys_of(obj)
+    col = {n: i for i, n in enumerate(names)}
+    per_key = {}                       # shape key -> values over frames (max of channels)
+    for a, ks in targets.items():
+        if a not in col:
+            continue
+        vals = [f[col[a]] for f in frames]
+        for k in ks:
+            prev = per_key.get(k)
+            per_key[k] = vals if prev is None else [max(x, y) for x, y in zip(prev, vals)]
+    if not per_key:
+        return 0
+    fr = [start_frame + i for i in range(len(frames))]
+    keep = [i for i, f in enumerate(fr) if not rng or rng[0] <= f <= rng[1]]
+    if not keep:
+        return 0
+    f0, f1 = fr[keep[0]], fr[keep[-1]]
+    sk = obj.data.shape_keys
+    if sk.animation_data and sk.animation_data.action:
+        for fc in _fcurves(sk.animation_data.action):
+            name = fc.data_path.split('"')[1] if '"' in fc.data_path else ""
+            if name in per_key:
+                for kp in reversed(list(fc.keyframe_points)):
+                    if f0 - 0.5 <= kp.co[0] <= f1 + 0.5:
+                        fc.keyframe_points.remove(kp, fast=True)
+                fc.update()
+    n = 0
+    for k, vals in per_key.items():
+        kb = keys[k]
+        lo, hi = kb.slider_min, kb.slider_max
+        first = True
+        fc = None
+        for i in keep:
+            v = max(lo, min(hi, vals[i] * intensity))
+            if first:
+                kb.value = v
+                kb.keyframe_insert("value", frame=fr[i])
+                path = kb.path_from_id("value")
+                fc = next(f for f in _fcurves(sk.animation_data.action) if f.data_path == path)
+                start = len(fc.keyframe_points)
+                fc.keyframe_points.add(len(keep) - 1)
+                first = False
+                j = start
+                continue
+            kp = fc.keyframe_points[j]
+            kp.co = (fr[i], v)
+            kp.interpolation = "BEZIER"
+            kp.handle_left_type = kp.handle_right_type = "AUTO_CLAMPED"
+            j += 1
+        fc.update()
+        n += len(keep)
+    return n
+
+
+def studio_paths(context):
+    prefs = context.preferences.addons[__name__].preferences if __name__ in \
+        context.preferences.addons else None
+    if not prefs:
+        return None, None, None
+    return (bpy.path.abspath(prefs.studio_python), bpy.path.abspath(prefs.studio_dir),
+            bpy.path.abspath(prefs.studio_model))
+
+
 # -------------------------------------------------------------- properties
 
 def _sound_strips(scene):
@@ -402,6 +521,11 @@ class LSR_Character(bpy.types.PropertyGroup):
     strip: EnumProperty(name="Strip", items=_strip_items)
     start_frame: IntProperty(name="Start frame", default=1,
                              description="Frame where the audio file starts")
+    engine: EnumProperty(name="Engine", items=[
+        ("RHUBARB", "Mouth shapes (Rhubarb)", "Rule-based mouth shapes, works out of the box"),
+        ("STUDIO", "Studio AI model", "Your own model trained on the studio's lip-synced "
+                                      "videos (set it up in the add-on preferences)")],
+        default="RHUBARB")
     language: EnumProperty(name="Language", items=[
         ("phonetic", "Any language (Hindi...)", "Language-independent recognizer"),
         ("pocketSphinx", "English", "More precise for English dialogue")], default="phonetic")
@@ -538,6 +662,10 @@ class LSR_OT_generate(bpy.types.Operator):
         path, frame0 = char_audio(c, context.scene)
         if not os.path.isfile(path):
             raise RuntimeError(f"audio file not found: {path}")
+        if c.engine == "STUDIO":
+            return self._start_studio(context, i, c, path, frame0)
+        if not self.exe:
+            raise RuntimeError("Rhubarb Lip Sync not found - click 'Download Rhubarb'")
         wav, tmp = wav_for_rhubarb(path)
         work = tempfile.mkdtemp(prefix="lipsync_rig_")
         dialog = None
@@ -567,7 +695,59 @@ class LSR_OT_generate(bpy.types.Operator):
         c.status = "listening..."
         return st
 
+    def _start_studio(self, context, i, c, path, frame0):
+        py, d, model = studio_paths(context)
+        script = os.path.join(d or "", "predict.py")
+        for what, f in (("Python with torch", py), ("face_model folder/predict.py", script),
+                        ("trained model", model)):
+            if not f or not os.path.isfile(f):
+                raise RuntimeError(f"Studio AI model: set '{what}' in the add-on preferences")
+        sc = context.scene
+        fps = sc.render.fps / sc.render.fps_base
+        work = tempfile.mkdtemp(prefix="lipsync_rig_")
+        out = os.path.join(work, "curves.json")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        p = subprocess.Popen([py, script, model, path, out, "--fps", str(fps)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                             creationflags=flags)
+        st = {"i": i, "p": p, "out": out, "frame0": frame0, "tmp": None, "progress": 0.5,
+              "err": "", "kind": "studio"}
+
+        def read():
+            st["err"] = (p.stderr.read() or "").strip()[-400:]
+        threading.Thread(target=read, daemon=True).start()
+        c.status = "AI model listening..."
+        return st
+
+    def _finish_studio(self, context, st):
+        c = context.scene.lsr_chars[st["i"]]
+        if st["p"].returncode != 0 or not os.path.isfile(st["out"]):
+            raise RuntimeError("Studio AI model failed: " + (st["err"] or
+                               f"exit {st['p'].returncode}"))
+        with open(st["out"], encoding="utf-8") as f:
+            data = json.load(f)
+        rng = (c.range_start, c.range_end) if c.use_range else None
+        tg = arkit_targets(c.obj)
+        if not tg:
+            raise RuntimeError(f"{c.obj.name} has no ARKit-style mouth shape keys "
+                               f"(jawOpen, mouthFunnel... or Jaw_Open, Mouth_Funnel_Up_L...)")
+        n = apply_curves(c.obj, data["names"], data["frames"], tg, st["frame0"],
+                         c.intensity, rng)
+        moved = []
+        if c.follow:
+            for o in followers(c.obj):
+                t2 = arkit_targets(o)
+                if t2:
+                    n += apply_curves(o, data["names"], data["frames"], t2, st["frame0"],
+                                      c.intensity, rng)
+                    moved.append(o.name)
+        c.status = f"AI model: {len(data['frames'])} frames, {len(tg)} mouth channels, " \
+                   f"{n} keys" + (f", +{len(moved)} meshes" if moved else "")
+        return c.status
+
     def _finish(self, context, st):
+        if st.get("kind") == "studio":
+            return self._finish_studio(context, st)
         c = context.scene.lsr_chars[st["i"]]
         if st["tmp"]:
             shutil.rmtree(os.path.dirname(st["tmp"]), ignore_errors=True)
@@ -598,7 +778,8 @@ class LSR_OT_generate(bpy.types.Operator):
     def execute(self, context):
         """Blocking run - used from scripts and in background mode."""
         self.exe = find_rhubarb(context)
-        if not self.exe:
+        if not self.exe and any(context.scene.lsr_chars[i].engine == "RHUBARB"
+                                for i in self._jobs(context)):
             self.report({"ERROR"}, "Rhubarb Lip Sync not found - click 'Download Rhubarb'")
             return {"CANCELLED"}
         for i in self._jobs(context):
@@ -614,7 +795,8 @@ class LSR_OT_generate(bpy.types.Operator):
 
     def invoke(self, context, event):
         self.exe = find_rhubarb(context)
-        if not self.exe:
+        if not self.exe and any(context.scene.lsr_chars[i].engine == "RHUBARB"
+                                for i in self._jobs(context)):
             self.report({"ERROR"}, "Rhubarb Lip Sync not found - click 'Download Rhubarb'")
             return {"CANCELLED"}
         self.queue = self._jobs(context)
@@ -704,7 +886,9 @@ class LSR_PT_panel(bpy.types.Panel):
                 box.prop(c, "start_frame")
             else:
                 box.prop(c, "strip")
-            box.prop(c, "language")
+            box.prop(c, "engine")
+            if c.engine == "RHUBARB":
+                box.prop(c, "language")
             box.prop(c, "dialog")
             box.prop(c, "intensity", slider=True)
             box.prop(c, "follow")
@@ -736,10 +920,20 @@ class LSR_Prefs(bpy.types.AddonPreferences):
     bl_idname = __name__
     rhubarb_path: StringProperty(name="Rhubarb executable", subtype="FILE_PATH",
                                  description="Leave empty to use the downloaded copy")
+    studio_python: StringProperty(name="Python with torch", subtype="FILE_PATH",
+                                  description="e.g. C:\\Projects\\3dLipsync\\lesgoo\\.venv\\Scripts\\python.exe")
+    studio_dir: StringProperty(name="face_model folder", subtype="DIR_PATH",
+                               description="The repository's lipsync-3d\\face_model folder")
+    studio_model: StringProperty(name="Trained model (.pt)", subtype="FILE_PATH")
 
     def draw(self, context):
         self.layout.prop(self, "rhubarb_path")
         self.layout.operator("lipsync_rig.download", icon="IMPORT")
+        box = self.layout.box()
+        box.label(text="Studio AI model (engine 'Studio AI model')")
+        box.prop(self, "studio_python")
+        box.prop(self, "studio_dir")
+        box.prop(self, "studio_model")
 
 
 CLASSES = (LSR_Character, LSR_OT_add, LSR_OT_remove, LSR_OT_auto_map, LSR_OT_download,
